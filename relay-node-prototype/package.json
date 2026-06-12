@@ -1,0 +1,15 @@
+{
+  "name": "face-chat-relay",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Multi-thread tmux→WS relay for face-chat-final. Mirrors agent sessions, detects idle, broadcasts to glasses web app + phone-native subscribers.",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "ws": "^8.18.0"
+  }
+}

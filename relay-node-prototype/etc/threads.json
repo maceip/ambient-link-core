@@ -1,0 +1,7 @@
+{
+  "_comment": "Threads to mirror. Each entry: { id, label, tmux, agent }. The tmux session must exist before relay starts (see agents/start-*.sh). Reload by SIGHUP.",
+  "threads": [
+    { "id": "claude", "label": "claude",  "tmux": "fc-claude", "agent": "claude" },
+    { "id": "codex",  "label": "codex",   "tmux": "fc-codex",  "agent": "codex"  }
+  ]
+}
