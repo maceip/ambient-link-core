@@ -203,10 +203,10 @@ func (h *Hub) buildHello() ([]byte, bool) {
 	h.mu.RLock()
 	src := h.mux
 	h.mu.RUnlock()
-	if src == nil {
-		return nil, false
+	var threads []mux.ThreadMeta
+	if src != nil {
+		threads = src.ThreadsHello()
 	}
-	threads := src.ThreadsHello()
 	rows := make([]helloThread, 0, len(threads))
 	for _, t := range threads {
 		rows = append(rows, helloThread{ID: t.ID, Label: t.Label, Agent: t.Agent})
@@ -270,12 +270,12 @@ func (h *Hub) fanout(except *client, payload []byte) {
 
 func (h *Hub) handleInbound(from *client, data []byte) {
 	var msg struct {
-		Type   string            `json:"type"`
-		Thread string            `json:"thread"`
-		Text   string            `json:"text"`
-		Enter  *bool             `json:"enter"`
-		Key    string            `json:"key"`
-		Since  map[string]int64  `json:"since"`
+		Type   string           `json:"type"`
+		Thread string           `json:"thread"`
+		Text   string           `json:"text"`
+		Enter  *bool            `json:"enter"`
+		Key    string           `json:"key"`
+		Since  map[string]int64 `json:"since"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		h.logger.Warn("hub: bad client frame", "err", err)
@@ -375,11 +375,11 @@ func (h *Hub) handleHudYank(from *client, threadID string) {
 
 // helloMessage is the greeting frame sent to newly-connected clients.
 type helloMessage struct {
-	Type       string            `json:"type"`
-	Threads    []helloThread     `json:"threads"`
-	Cursor     map[string]int64  `json:"cursor"`
-	RelayDebug bool              `json:"relay_debug,omitempty"`
-	At         int64             `json:"at,omitempty"`
+	Type       string           `json:"type"`
+	Threads    []helloThread    `json:"threads"`
+	Cursor     map[string]int64 `json:"cursor"`
+	RelayDebug bool             `json:"relay_debug,omitempty"`
+	At         int64            `json:"at,omitempty"`
 }
 
 type helloThread struct {

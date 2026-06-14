@@ -9,9 +9,9 @@ for manual runs and local debugging — not required for normal hook-based setup
 
 | Script | Session | Default agent |
 |---|---|---|
-| [`start-claude.sh`](start-claude.sh) | `fc-claude` | `claude --dangerously-skip-permissions` |
-| [`start-codex.sh`](start-codex.sh) | `fc-codex` | `codex` |
-| [`start-bash.sh`](start-bash.sh) | `fc-bash` | `bash` (raw shell, useful for debugging) |
+| [`start-claude.sh`](start-claude.sh) | `ambient-claude` | `claude --dangerously-skip-permissions` |
+| [`start-codex.sh`](start-codex.sh) | `ambient-codex` | `codex` |
+| [`start-bash.sh`](start-bash.sh) | `ambient-bash` | `bash` (raw shell, useful for debugging) |
 
 Scripts are idempotent — re-running attaches to the existing session instead
 of creating a duplicate.

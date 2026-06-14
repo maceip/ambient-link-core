@@ -1,4 +1,4 @@
-// Package producers exposes POST /face-chat/ingest — virtual/manual glue only.
+// Package producers exposes POST /ambient-link/ingest — virtual/manual glue only.
 // Cursor Agent CLI is observed via JSONL + proc (+ hooks when installed).
 package producers
 
@@ -19,7 +19,7 @@ type IngestConfig struct {
 	MaxBodyBytes int64
 }
 
-// NewIngest returns an http.Handler for POST /face-chat/ingest.
+// NewIngest returns an http.Handler for POST /ambient-link/ingest.
 //
 // Body shape:
 //
@@ -145,5 +145,5 @@ func PushAssistant(ing Ingester, sessionID, agent, cwd, message string) error {
 
 // ParseIngestURL returns true when path is the ingest endpoint.
 func ParseIngestURL(path string) bool {
-	return strings.TrimSuffix(path, "/") == "/face-chat/ingest"
+	return strings.TrimSuffix(path, "/") == "/ambient-link/ingest"
 }

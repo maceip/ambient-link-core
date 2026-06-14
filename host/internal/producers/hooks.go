@@ -46,8 +46,8 @@ type HooksConfig struct {
 
 // NewHooks returns an http.Handler that accepts hook POSTs at:
 //
-//	POST /face-chat/hooks/claude
-//	POST /face-chat/hooks/codex
+//	POST /ambient-link/hooks/claude
+//	POST /ambient-link/hooks/codex
 //
 // The handler dispatches to the appropriate parser and forwards the
 // resulting proto.Event into ing.Ingest. Returns 204 on success, 400 on
@@ -63,8 +63,8 @@ func NewHooks(ing Ingester, cfg HooksConfig) http.Handler {
 		cfg.Logger = slog.Default()
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/face-chat/hooks/claude", &hookHandler{ing: ing, cfg: cfg, parser: parseClaude})
-	mux.Handle("/face-chat/hooks/codex", &hookHandler{ing: ing, cfg: cfg, parser: parseCodex})
+	mux.Handle("/ambient-link/hooks/claude", &hookHandler{ing: ing, cfg: cfg, parser: parseClaude})
+	mux.Handle("/ambient-link/hooks/codex", &hookHandler{ing: ing, cfg: cfg, parser: parseCodex})
 	return mux
 }
 

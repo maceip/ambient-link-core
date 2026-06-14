@@ -62,7 +62,7 @@ Evidence:
 - `cursor-agent --resume <session_id>` is a **CLI session id**, not the same
   surface as `@cursor/sdk` agent IDs unless explicitly bridged.
 
-**Implication for Ambient Link:** Cursor observation via `POST /face-chat/ingest`
+**Implication for Ambient Link:** Cursor observation via `POST /ambient-link/ingest`
 (from a Cursor extension or hook) is correct. Delivery for live IDE sessions
 is **outbox + ingest-side consumer** (extension reads outbox and injects into
 Composer), **not** `@cursor/sdk` against the open tab.
@@ -93,8 +93,8 @@ requests). Hooks are the official bidirectional surface. Installer wires
 | Layer | Authority | Sync mechanism |
 |---|---|---|
 | Mac agents | Ground truth | hooks + JSONL + proc → mux |
-| Go host mux | Canonical session state | `/face-chat/status`, WS `hello` + `thread_*` |
-| Web companion | Cache | WS events + poll `/face-chat/status` every 15s |
+| Go host mux | Canonical session state | `/ambient-link/status`, WS `hello` + `thread_*` |
+| Web companion | Cache | WS events + poll `/ambient-link/status` every 15s |
 | Phone APK | Cache | WS `hello` + `thread_idle`/`hud_yank`; chip → `input` |
 | Glasses DAT | Display only | Phone `HudPresenter`; no direct host link |
 

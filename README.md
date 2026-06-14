@@ -1,14 +1,14 @@
 # ambient-link-core
 
 > The hardware-agnostic core of **Ambient Link** — a framework for surfacing
-> live coding-agent activity on face-worn displays.
+> live coding-agent activity on wearable displays.
 
 Ambient Link separates **what's happening with your agents** from **where you
 look to see it**. This repository is the "what's happening" half: a daemon
 that watches your `claude` / `codex` / future coding agents wherever they
 run, normalizes their lifecycle events into a single wire protocol, and
 fans them out to hardware-specific "relay" clients (mobile apps that drive
-the actual face-worn display).
+the actual wearable display).
 
 The current target relay is at **[ambient-link-meta](https://github.com/maceip/ambient-link-meta)**
 (Meta Ray-Ban Display glasses). Future targets (Apple, Android XR) get
@@ -33,11 +33,11 @@ cd host
 go build -o /usr/local/bin/ambient-link-host ./cmd/host
 ambient-link-host install       # writes Claude/Codex hook configs + service unit
 ambient-link-host serve         # foreground; or use the service unit
-curl localhost:5181/face-chat/status
+curl localhost:5181/ambient-link/status
 ```
 
 Then point your relay app (e.g. ambient-link-meta) at
-`ws://<host-ip>:5181/face-chat/ws`.
+`ws://<host-ip>:5181/ambient-link/ws`.
 
 ## Design principles
 

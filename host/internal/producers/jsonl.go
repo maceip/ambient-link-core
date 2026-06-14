@@ -35,6 +35,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -87,15 +88,15 @@ type JSONLConfig struct {
 
 // JSONLTailer runs the tailing pipeline.
 type JSONLTailer struct {
-	cfg  JSONLConfig
-	ing  Ingester
-	wch  *fsnotify.Watcher
+	cfg JSONLConfig
+	ing Ingester
+	wch *fsnotify.Watcher
 
-	mu              sync.Mutex
-	open            map[string]*fileTail
-	stopped         bool
-	deferredWarnAt  time.Time // throttle "max open files" warnings to one per minute
-	codexState      codexFileState
+	mu             sync.Mutex
+	open           map[string]*fileTail
+	stopped        bool
+	deferredWarnAt time.Time // throttle "max open files" warnings to one per minute
+	codexState     codexFileState
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -671,7 +672,7 @@ func cursorCWDFromPath(file string) string {
 	if i < 0 {
 		return ""
 	}
-	return filepath.Join("/Users", body[:i], body[i+1:])
+	return path.Join("/Users", body[:i], body[i+1:])
 }
 
 // payloadString pulls a string field from a json.RawMessage payload.

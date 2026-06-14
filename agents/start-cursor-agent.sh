@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Start (or attach to) Cursor Agent CLI in tmux — reliable HUD delivery via send-keys.
 set -euo pipefail
-SESSION="${FC_CURSOR_SESSION:-fc-cursor}"
-CMD="${FC_CURSOR_CMD:-agent --yolo}"
+SESSION="${AMBIENT_CURSOR_SESSION:-ambient-cursor}"
+CMD="${AMBIENT_CURSOR_CMD:-agent --yolo}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "[$SESSION] already running — attach with: tmux attach -t $SESSION"
 else

@@ -31,7 +31,7 @@ func Advertise(ctx context.Context, listenAddr, token string, log *slog.Logger) 
 	if name == "" {
 		name = "ambient-link"
 	}
-	txt := []string{"v=1", "path=/face-chat/ws"}
+	txt := []string{"v=1", "path=/ambient-link/ws"}
 	if token != "" {
 		txt = append(txt, "token="+token)
 	}

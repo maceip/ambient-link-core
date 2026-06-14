@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Start (or attach to) the tmux session the relay mirrors as the "claude" thread.
 set -euo pipefail
-SESSION="${FC_CLAUDE_SESSION:-fc-claude}"
-CMD="${FC_CLAUDE_CMD:-claude --dangerously-skip-permissions}"
+SESSION="${AMBIENT_CLAUDE_SESSION:-ambient-claude}"
+CMD="${AMBIENT_CLAUDE_CMD:-claude --dangerously-skip-permissions}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "[$SESSION] already running — attach with: tmux attach -t $SESSION"
 else

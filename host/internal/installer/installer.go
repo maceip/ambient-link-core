@@ -6,7 +6,7 @@
 // We never overwrite a hook entry we didn't write — installs merge in,
 // uninstalls remove only our marked entries.
 //
-// The marker is the literal string "face-chat-host" appearing in the URL
+// The marker is the literal string "ambient-link-host" appearing in the URL
 // (or command, for Codex) of each hook entry — easy to grep, easy to
 // reverse.
 package installer
@@ -30,7 +30,7 @@ import (
 
 // HookEntryMarker is the substring we put into every hook URL/command so
 // Uninstall can identify and remove only what Install created.
-const HookEntryMarker = "face-chat-host"
+const HookEntryMarker = "ambient-link-host"
 
 // Options drives Install / Uninstall behavior.
 type Options struct {
@@ -182,11 +182,11 @@ func Uninstall(opts Options) error {
 // for the events that matter for session lifecycle.
 type claudeSettings = map[string]any
 type claudeHookEntry struct {
-	Matcher string         `json:"matcher,omitempty"`
-	Handler claudeHandler  `json:"handler"`
+	Matcher string        `json:"matcher,omitempty"`
+	Handler claudeHandler `json:"handler"`
 }
 type claudeHandler struct {
-	Type   string            `json:"type"`             // "http"
+	Type   string            `json:"type"` // "http"
 	URL    string            `json:"url,omitempty"`
 	Header map[string]string `json:"header,omitempty"`
 }
@@ -223,14 +223,14 @@ func installClaudeHooks(path, hostURL, token string) (bool, error) {
 	changed := false
 	for _, w := range want {
 		existing := entriesFor(w.event)
-		if hasFaceChatHookEntry(existing) {
+		if hasAmbientLinkHookEntry(existing) {
 			continue
 		}
 		entry := claudeHookEntry{
 			Matcher: w.matcher,
 			Handler: claudeHandler{
 				Type: "http",
-				URL:  strings.TrimRight(hostURL, "/") + "/face-chat/hooks/claude?marker=" + HookEntryMarker,
+				URL:  strings.TrimRight(hostURL, "/") + "/ambient-link/hooks/claude?marker=" + HookEntryMarker,
 				Header: map[string]string{
 					"Authorization": "Bearer " + token,
 				},
@@ -285,9 +285,9 @@ func uninstallClaudeHooks(path string) error {
 	return writeJSON(path, settings, 0o644)
 }
 
-// hasFaceChatHookEntry checks whether any entry in arr carries our marker
+// hasAmbientLinkHookEntry checks whether any entry in arr carries our marker
 // in its handler URL.
-func hasFaceChatHookEntry(arr []any) bool {
+func hasAmbientLinkHookEntry(arr []any) bool {
 	for _, x := range arr {
 		m, _ := x.(map[string]any)
 		h, _ := m["handler"].(map[string]any)
@@ -337,7 +337,7 @@ func installCodexHooks(path, hostURL, token string) (bool, error) {
 		"PermissionRequest",
 		"Stop", "SubagentStop",
 	}
-	url := strings.TrimRight(hostURL, "/") + "/face-chat/hooks/codex?marker=" + HookEntryMarker
+	url := strings.TrimRight(hostURL, "/") + "/ambient-link/hooks/codex?marker=" + HookEntryMarker
 	curlCmd := fmt.Sprintf(
 		`curl -sS -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' --data-binary @- %s`,
 		token, url,
@@ -345,7 +345,7 @@ func installCodexHooks(path, hostURL, token string) (bool, error) {
 	changed := false
 	for _, ev := range wantEvents {
 		existing, _ := hooks[ev].([]any)
-		if hasFaceChatHookEntry(existing) {
+		if hasAmbientLinkHookEntry(existing) {
 			continue
 		}
 		entry := map[string]any{
@@ -457,7 +457,7 @@ func installSystemdUserUnit(name, binaryPath, hostURL, token string) (string, bo
 	}
 	unitPath := filepath.Join(dir, strings.TrimSuffix(name, ".service")+".service")
 	unit := fmt.Sprintf(`[Unit]
-Description=face-chat host daemon
+Description=ambient-link host daemon
 After=network.target
 
 [Service]

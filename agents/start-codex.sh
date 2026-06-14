@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SESSION="${FC_CODEX_SESSION:-fc-codex}"
-CMD="${FC_CODEX_CMD:-codex}"
+SESSION="${AMBIENT_CODEX_SESSION:-ambient-codex}"
+CMD="${AMBIENT_CODEX_CMD:-codex}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "[$SESSION] already running — attach with: tmux attach -t $SESSION"
 else

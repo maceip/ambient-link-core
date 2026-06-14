@@ -14,7 +14,7 @@ import (
 
 const Version = 1
 
-// Payload is returned by GET /face-chat/pair and encoded in QR deep links.
+// Payload is returned by GET /ambient-link/pair and encoded in QR deep links.
 type Payload struct {
 	V        int    `json:"v"`
 	WSURL    string `json:"wsUrl"`
@@ -40,7 +40,7 @@ func Build(listenAddr, token, wsScheme string) (Payload, error) {
 	if host != "" && host != "0.0.0.0" && host != "::" {
 		wsHost = host
 	}
-	wsURL := fmt.Sprintf("%s://%s:%s/face-chat/ws", wsScheme, wsHost, port)
+	wsURL := fmt.Sprintf("%s://%s:%s/ambient-link/ws", wsScheme, wsHost, port)
 	hostname, _ := os.Hostname()
 	p := Payload{
 		V:        Version,
@@ -153,13 +153,13 @@ func DefaultHookURL() string {
 
 // FetchRunning asks a local daemon for its pair payload.
 func FetchRunning(statusBase string) (Payload, error) {
-	resp, err := http.Get(strings.TrimRight(statusBase, "/") + "/face-chat/pair")
+	resp, err := http.Get(strings.TrimRight(statusBase, "/") + "/ambient-link/pair")
 	if err != nil {
 		return Payload{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return Payload{}, fmt.Errorf("pair: GET /face-chat/pair: %s", resp.Status)
+		return Payload{}, fmt.Errorf("pair: GET /ambient-link/pair: %s", resp.Status)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

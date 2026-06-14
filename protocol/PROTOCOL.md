@@ -1,6 +1,6 @@
-# phone-shared — WS protocol
+# protocol — WS protocol
 
-The contract both `phone-android` and `phone-ios` implement against the
+The contract both `relay-android` and `relay-ios` implement against the
 Go host daemon ([`host/`](../host)). Keep this file in sync with both
 codebases; bump `PROTOCOL_VERSION` below when you break wire compat.
 
@@ -12,7 +12,7 @@ _Additive in v1: `hud_yank` (web → server → phone daemons), `dictate_*` (pho
 
 ## Transport
 
-- WebSocket, `wss://<relay-host>/face-chat/ws`
+- WebSocket, `wss://<relay-host>/ambient-link/ws`
 - Text frames, one JSON object per frame, no batching
 - Phone daemon reconnects with exponential backoff (500ms → 10s cap) on
   `close` and `error`; resumes per-thread cursor on reconnect
@@ -41,7 +41,7 @@ Sent once on connect.
 
 ### `thread_idle` — THE YANK TRIGGER
 
-Emitted by the relay when a thread's output stops for `FC_IDLE_MS` (default
+Emitted by the relay when a thread's output stops for `AMBIENT_IDLE_MS` (default
 2000ms). This is what causes the phone to wake DAT and render a peek card.
 
 ```json

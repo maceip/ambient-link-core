@@ -1,5 +1,5 @@
 // Command host runs the laptop-side daemon that produces session events for
-// the face-chat mobile relays. It wires the SessionMux to three parallel
+// the ambient-link mobile relays. It wires the SessionMux to three parallel
 // producers (hooks ingest, JSONL tailer, process watcher) and a WS sink.
 //
 // Usage:
@@ -30,13 +30,13 @@ import (
 
 	"github.com/maceip/ambient-link-core/host/internal/delivery"
 	"github.com/maceip/ambient-link-core/host/internal/discovery"
-	"github.com/maceip/ambient-link-core/host/internal/installer"
 	"github.com/maceip/ambient-link-core/host/internal/inject"
+	"github.com/maceip/ambient-link-core/host/internal/installer"
 	"github.com/maceip/ambient-link-core/host/internal/journal"
 	"github.com/maceip/ambient-link-core/host/internal/mux"
 	"github.com/maceip/ambient-link-core/host/internal/pair"
-	"github.com/maceip/ambient-link-core/host/internal/proto"
 	"github.com/maceip/ambient-link-core/host/internal/producers"
+	"github.com/maceip/ambient-link-core/host/internal/proto"
 	"github.com/maceip/ambient-link-core/host/internal/sink"
 	"github.com/maceip/ambient-link-core/host/internal/webapp"
 )
@@ -104,7 +104,7 @@ func runInstall() error {
 	fmt.Println("  bearer token:   ", res.BearerToken)
 	fmt.Println()
 	fmt.Println("next: restart the host daemon with `-token`", res.BearerToken)
-	fmt.Println("      then start a `claude` or `codex` session — events should arrive at", *hostURL+"/face-chat/status")
+	fmt.Println("      then start a `claude` or `codex` session — events should arrive at", *hostURL+"/ambient-link/status")
 	return nil
 }
 
@@ -119,7 +119,7 @@ func runUninstall() error {
 func runStatus() error {
 	url := flag.String("host-url", "http://127.0.0.1:5181", "running host's status URL base")
 	flag.Parse()
-	resp, err := http.Get(*url + "/face-chat/status")
+	resp, err := http.Get(*url + "/ambient-link/status")
 	if err != nil {
 		return err
 	}
@@ -138,12 +138,12 @@ func boolWord(b bool, yes, no string) string {
 func runServe() error {
 	var (
 		listen          = flag.String("listen", defaultListen, "host:port for the HTTP+WS server")
-		token           = flag.String("token", "", "bearer token required on /face-chat/hooks/* POSTs (empty = disabled)")
+		token           = flag.String("token", "", "bearer token required on /ambient-link/hooks/* POSTs (empty = disabled)")
 		logLvl          = flag.String("log", "info", "log level: debug | info | warn | error")
 		relayDebug      = flag.Bool("relay-debug", false, "suppress auto thread_idle/busy to clients; explicit hud_yank only")
 		webRoot         = flag.String("web-root", defaultWebRoot(), "glasses companion SPA directory (empty = disabled)")
-		jsonlRoot      = flag.String("jsonl-root", defaultClaudeJSONLRoot(), "root of Claude Code session JSONL files; empty disables Claude JSONL tailer")
-		codexJSONLRoot = flag.String("codex-jsonl-root", defaultCodexJSONLRoot(), "root of Codex session JSONL files; empty disables Codex JSONL tailer")
+		jsonlRoot       = flag.String("jsonl-root", defaultClaudeJSONLRoot(), "root of Claude Code session JSONL files; empty disables Claude JSONL tailer")
+		codexJSONLRoot  = flag.String("codex-jsonl-root", defaultCodexJSONLRoot(), "root of Codex session JSONL files; empty disables Codex JSONL tailer")
 		cursorJSONLRoot = flag.String("cursor-jsonl-root", defaultCursorJSONLRoot(), "root of Cursor Agent transcript JSONL; empty disables Cursor JSONL tailer")
 	)
 	flag.Parse()
@@ -174,13 +174,13 @@ func runServe() error {
 	ingestHandler := producers.NewIngest(m, producers.IngestConfig{Logger: logger})
 
 	root := http.NewServeMux()
-	root.Handle("/face-chat/ws", hub)
-	root.Handle("/face-chat/hooks/", hooksHandler)
-	root.Handle("/face-chat/ingest", ingestHandler)
+	root.Handle("/ambient-link/ws", hub)
+	root.Handle("/ambient-link/hooks/", hooksHandler)
+	root.Handle("/ambient-link/ingest", ingestHandler)
 	root.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
-	root.HandleFunc("/face-chat/status", func(w http.ResponseWriter, r *http.Request) {
+	root.HandleFunc("/ambient-link/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(w, map[string]any{
 			"sessions":    m.Snapshot(),
@@ -190,7 +190,7 @@ func runServe() error {
 			"now":         time.Now().UnixMilli(),
 		})
 	})
-	root.HandleFunc("/face-chat/pair", func(w http.ResponseWriter, r *http.Request) {
+	root.HandleFunc("/ambient-link/pair", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		p, err := pair.Build(*listen, *token, "ws")
 		if err != nil {
@@ -200,7 +200,7 @@ func runServe() error {
 		writeJSON(w, p)
 	})
 	// Debug: pop glasses HUD from curl (keyboard / automation, no phone UI).
-	root.HandleFunc("/face-chat/debug/yank", func(w http.ResponseWriter, r *http.Request) {
+	root.HandleFunc("/ambient-link/debug/yank", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
@@ -243,7 +243,7 @@ func runServe() error {
 		})
 		writeJSON(w, map[string]string{"ok": "yank"})
 	})
-	root.HandleFunc("/face-chat/debug/input", func(w http.ResponseWriter, r *http.Request) {
+	root.HandleFunc("/ambient-link/debug/input", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
@@ -276,8 +276,15 @@ func runServe() error {
 		if st, err := os.Stat(*webRoot); err != nil || !st.IsDir() {
 			return fmt.Errorf("web-root %q: %w", *webRoot, err)
 		}
-		root.Handle("/", webapp.Dir(*webRoot))
-		logger.Info("host: serving web companion", "root", *webRoot)
+		root.Handle("/ambient-link/", http.StripPrefix("/ambient-link", webapp.Dir(*webRoot)))
+		root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				http.Redirect(w, r, "/ambient-link/", http.StatusFound)
+				return
+			}
+			http.NotFound(w, r)
+		})
+		logger.Info("host: serving web companion", "root", *webRoot, "base", "/ambient-link/")
 	}
 
 	srv := &http.Server{
@@ -357,12 +364,12 @@ func runServe() error {
 		logger.Info("host: listening",
 			"addr", *listen,
 			"endpoints", []string{
-				"/face-chat/ws",
-				"/face-chat/ingest",
-				"/face-chat/pair",
-				"/face-chat/hooks/claude",
-				"/face-chat/hooks/codex",
-				"/face-chat/status",
+				"/ambient-link/ws",
+				"/ambient-link/ingest",
+				"/ambient-link/pair",
+				"/ambient-link/hooks/claude",
+				"/ambient-link/hooks/codex",
+				"/ambient-link/status",
 				"/healthz",
 			},
 			"auth", boolStr(*token != ""),
@@ -481,7 +488,7 @@ func runPair() error {
 		fmt.Println("Token:    ", p.Token)
 	}
 	fmt.Println()
-	fmt.Println("Glasses web app:", strings.Replace(*statusURL, "http://", "http://", 1)+"/")
+	fmt.Println("Glasses web app:", strings.TrimRight(*statusURL, "/")+"/ambient-link/")
 	return nil
 }
 

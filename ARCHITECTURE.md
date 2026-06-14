@@ -71,11 +71,11 @@ into the relay.
 | **Claude Code CLI hooks** (`~/.claude/settings.json`, `http` handler) | All local `claude` sessions on machines where the user installs the config | none | <1s | filesystem write | documented, supported | **PRIMARY** |
 | **Codex CLI hooks** (`hooks.json`, `command:` handler with `curl`) | All local `codex` sessions on configured machines | none | <1s | filesystem write | `command:` handler stable; `http:` handler parsed-and-skipped today | **PRIMARY** |
 | **tmux pipe-pane wrapper** (current relay default) | Any CLI run inside the wrapped tmux session | none | <2s + idle-detect debounce | none | DIY, what we already have | **FALLBACK** for users who don't want to edit hook configs |
-| **Direct ingest HTTP endpoint** on the relay (`POST /face-chat/ingest`) | Anything that can `curl` | shared bearer | <1s | none | our own — to be built | **GLUE** for any of the above |
+| **Direct ingest HTTP endpoint** on the relay (`POST /ambient-link/ingest`) | Anything that can `curl` | shared bearer | <1s | none | our own — to be built | **GLUE** for any of the above |
 | Anthropic Managed Agents webhooks | Only sessions launched through CMA harness | API key + signing secret | seconds | none | documented | parked — too specific to one Anthropic product |
 | OpenAI webhooks | API-account events (batch, fine-tune); **not** ChatGPT/Codex session state | API key | n/a | none | documented but doesn't fire the events we care about | not useful |
 | Claude Code Remote Control mobile push | Anthropic-internal channel from CLI → user's Claude mobile app | n/a | n/a | n/a | not exposed to third parties | unusable |
-| Claude Android `NotificationListenerService` | Whatever notifications Claude Android happens to post, IF the user has Claude notifications enabled | system grant | <1s | special access | research probe at `phone-android/.../probe/` | OPT-IN bonus only — most users keep AI app notifications off |
+| Claude Android `NotificationListenerService` | Whatever notifications Claude Android happens to post, IF the user has Claude notifications enabled | system grant | <1s | special access | research probe at `relay-android/.../probe/` | OPT-IN bonus only — most users keep AI app notifications off |
 | Accessibility service scraping (Claude / ChatGPT) | Any foreground UI text | accessibility grant | seconds | very heavy | Play Store policy risk | avoid |
 | Browser extension (user-installed) | `claude.ai/chats` + `claude.ai/code` + `chatgpt.com` + `chatgpt.com/codex` — separate observers per surface since they don't overlap | user installs extension | <1s | Chrome perms | undocumented internal SSE; legitimate if user-installed | RESEARCH — covers web-only sessions, but four distinct surfaces to maintain |
 | Reverse-engineered cookie replay of claude.ai/chatgpt.com | All web sessions on captured account | captured cookies | streaming | full-account risk, ToS violating | unofficial | NEVER |
@@ -84,14 +84,14 @@ into the relay.
 
 Three concrete paths plus a glue point:
 
-1. **`POST /face-chat/ingest`** on the relay — single HTTP endpoint that
+1. **`POST /ambient-link/ingest`** on the relay — single HTTP endpoint that
    takes a JSON event and re-broadcasts it as if it came from a tmux
    thread idle. This is the entry point everything else hits.
 
 2. **Claude Code hooks installer** — a small script that drops a hook
    config into `~/.claude/settings.json` that POSTs `Stop` and
    `Notification(matcher: permission_prompt)` events to
-   `<relay>/face-chat/ingest`.
+   `<relay>/ambient-link/ingest`.
 
 3. **Codex CLI hooks installer** — same, but using `command:` handlers
    that `curl` because Codex's `http:` handler isn't executed today.
@@ -101,7 +101,7 @@ Three concrete paths plus a glue point:
 
 5. **(Parked, available)** Local `NotificationListenerService` opt-in for
    users who happen to have Claude Android notifications on. Already
-   scaffolded in `phone-android/.../probe/`, not in default path.
+   scaffolded in `relay-android/.../probe/`, not in default path.
 
 ## Coverage we get
 
