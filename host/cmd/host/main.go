@@ -192,10 +192,20 @@ func runServe() error {
 	})
 	root.HandleFunc("/ambient-link/pair", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		p, err := pair.Build(*listen, *token, "ws")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		var p pair.Payload
+		var err error
+		if r.Host != "" {
+			wsScheme := "ws"
+			if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+				wsScheme = "wss"
+			}
+			p = pair.BuildForHost(r.Host, *token, wsScheme)
+		} else {
+			p, err = pair.Build(*listen, *token, "ws")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		writeJSON(w, p)
 	})

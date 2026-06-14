@@ -52,6 +52,23 @@ func Build(listenAddr, token, wsScheme string) (Payload, error) {
 	return p, nil
 }
 
+// BuildForHost constructs a pairing payload for a known externally reachable
+// HTTP host, such as the Host header seen behind Caddy/nginx.
+func BuildForHost(hostport, token, wsScheme string) Payload {
+	if wsScheme == "" {
+		wsScheme = "ws"
+	}
+	hostname, _ := os.Hostname()
+	p := Payload{
+		V:        Version,
+		WSURL:    fmt.Sprintf("%s://%s/ambient-link/ws", wsScheme, hostport),
+		Token:    token,
+		Hostname: hostname,
+	}
+	p.PairURL = EncodeDeepLink(p)
+	return p
+}
+
 // EncodeDeepLink returns ambientlink://pair?… for QR codes and universal links.
 func EncodeDeepLink(p Payload) string {
 	q := url.Values{}
