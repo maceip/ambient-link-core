@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maceip/ambient-link-core/host/internal/delivery"
 	"github.com/maceip/ambient-link-core/host/internal/proto"
 )
 
@@ -39,6 +40,8 @@ type HooksConfig struct {
 	// MaxBodyBytes caps each request body. Default 256 KiB.
 	MaxBodyBytes int64
 	Logger       *slog.Logger
+	// Outbox is drained on hook events to deliver HUD replies bidirectionally.
+	Outbox *delivery.Outbox
 }
 
 // NewHooks returns an http.Handler that accepts hook POSTs at:
@@ -103,6 +106,13 @@ func (h *hookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, ev := range events {
 		_ = h.ing.Ingest(ev) // mux logs its own warnings; duplicates not surfaced
+	}
+	hook, _ := raw["hook_event_name"].(string)
+	sid, _ := raw["session_id"].(string)
+	if resp := delivery.HookResponse(hook, sid, raw, h.cfg.Outbox); resp != nil {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

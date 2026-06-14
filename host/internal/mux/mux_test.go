@@ -91,8 +91,8 @@ func TestSessionLifecycleTransitions(t *testing.T) {
 	if len(idles) < 1 {
 		t.Fatalf("want >=1 thread_idle, got %d", len(idles))
 	}
-	if idles[0].Awaiting != "reply" {
-		t.Errorf("idle.awaiting = %q, want %q", idles[0].Awaiting, "reply")
+	if idles[0].Awaiting != "done" {
+		t.Errorf("idle.awaiting = %q, want %q", idles[0].Awaiting, "done")
 	}
 }
 

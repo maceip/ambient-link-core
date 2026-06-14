@@ -21,8 +21,7 @@ same host.
 |---|---|
 | [`host/`](host) | The production host daemon (Go). Multi-source signal aggregator: hooks ingest, JSONL tailer, process watcher → state machine → WS broadcast. |
 | [`protocol/PROTOCOL.md`](protocol/PROTOCOL.md) | Wire-stable protocol between host and any relay. Single source of truth — both Go and any relay implementation must conform. |
-| [`agents/`](agents) | Helper scripts to launch `claude` / `codex` / etc. inside a tmux session the host can mirror (fallback for setups without hooks). |
-| [`relay-node-prototype/`](relay-node-prototype) | Original Node prototype, preserved for reference. The Go host in [`host/`](host) supersedes it. |
+| [`agents/`](agents) | Helper scripts to launch `claude` / `codex` / etc. in local tmux sessions (optional; the Go host normally uses hooks + JSONL). |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Full coverage of which signal sources see which sessions, why we run them in parallel, and what the option space looks like. |
 
 ## Quick start

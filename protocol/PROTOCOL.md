@@ -1,12 +1,14 @@
 # phone-shared — WS protocol
 
-The contract both `phone-android` and `phone-ios` implement against
-[`relay/server.mjs`](../relay/server.mjs). Keep this file in sync with
-both codebases; bump `PROTOCOL_VERSION` below when you break wire compat.
+The contract both `phone-android` and `phone-ios` implement against the
+Go host daemon ([`host/`](../host)). Keep this file in sync with both
+codebases; bump `PROTOCOL_VERSION` below when you break wire compat.
 
 ```
 PROTOCOL_VERSION = 1
 ```
+
+_Additive in v1: `hud_yank` (web → server → phone daemons), `dictate_*` (phone/web STT sessions)._
 
 ## Transport
 
@@ -46,10 +48,17 @@ Emitted by the relay when a thread's output stops for `FC_IDLE_MS` (default
 {
   "type": "thread_idle",
   "thread": "claude",
+  "label": "claude",
+  "agent": "claude",
   "lastAssistant": "Done — pushed to main. Want me to open a PR?",
+  "awaiting": "reply",
   "at": 1717000000000
 }
 ```
+
+When the host mux detects a tool permission prompt, the same message
+includes `awaiting: "permission"` and `permissionPrompt` (the prompt text).
+Phone daemons render approve/deny chips directly on the peek card.
 
 The phone daemon SHOULD:
 1. Classify `lastAssistant` to pick a chip set (see "Chip classification" below).
@@ -73,7 +82,45 @@ peek/expand card for the same thread (the agent started typing again).
 Streaming text deltas / full snapshots. The phone daemon does NOT need
 these — they exist for the web app. Skip on receipt.
 
-## Phone → server messages
+### `hud_yank` — MANUAL PEEK FROM WEB
+
+Forwarded by the relay when the glasses web app asks the phone daemon to
+push a peek card for a thread (e.g. user taps **push to HUD** in chat).
+Same payload shape as `thread_idle`; phone daemons SHOULD treat it
+identically (`HudPresenter.yank()`).
+
+```json
+{
+  "type": "hud_yank",
+  "thread": "claude",
+  "label": "claude",
+  "agent": "claude",
+  "lastAssistant": "Done — pushed to main. Want me to open a PR?",
+  "awaiting": "reply",
+  "at": 1717000000000
+}
+```
+
+Not sent back to the requesting web client (relay fans out to other
+connected clients only).
+
+### `dictate_active`, `dictate_partial`, `dictate_end`
+
+The host fans out dictation UI state while a client captures speech.
+Capture runs on the phone (`SpeechRecognizer`) or web (`SpeechRecognition`);
+on-device SODA (see `~/neural/.../lib/soda`) is a future v2 path.
+
+```json
+{ "type": "dictate_active", "thread": "claude", "source": "phone", "at": 1717000000000 }
+{ "type": "dictate_partial", "thread": "claude", "text": "please fix the", "source": "web", "at": 1717000000001 }
+{ "type": "dictate_end", "thread": "claude", "text": "please fix the tests", "source": "phone", "at": 1717000000002 }
+```
+
+`dictate_end` with empty `text` means the session was aborted. When `text`
+is set on commit, the host has already injected the transcript via the same
+path as `input` and updated mux `lastUserInput`.
+
+## Web / phone → server messages
 
 ### `subscribe`
 
@@ -87,7 +134,7 @@ content, so `since` can be empty or omit individual threads.
 ### `input` — REPLY FROM HUD
 
 When the user taps a chip in the expanded card, the daemon emits the
-corresponding text input back to the agent's tmux session.
+corresponding text input back to the agent session (via the host).
 
 ```json
 { "type": "input", "thread": "claude", "text": "yes", "enter": true }
@@ -101,6 +148,30 @@ specific `y`/`N` keystroke without echo), use `special`:
 
 ```json
 { "type": "special", "thread": "claude", "key": "y" }
+```
+
+### `hud_yank` — REQUEST PEEK ON PHONE
+
+Sent by the glasses web app when the user wants the native daemon to
+render a HUD peek for the current thread. The relay enriches `thread`
+with `label` and `lastAssistant` from live pane state, then forwards
+`hud_yank` to connected phone daemons.
+
+```json
+{ "type": "hud_yank", "thread": "claude" }
+```
+
+### `dictate_begin`, `dictate_partial`, `dictate_commit`, `dictate_abort`
+
+Phone or web companion starts dictation for a thread. Partials are UI-only;
+`dictate_commit` injects `text` with `enter: true` and records
+`lastUserInput` on the mux (same as tapping a chip).
+
+```json
+{ "type": "dictate_begin", "thread": "claude", "source": "phone" }
+{ "type": "dictate_partial", "thread": "claude", "text": "please fix", "source": "phone" }
+{ "type": "dictate_commit", "thread": "claude", "text": "please fix the tests", "source": "phone" }
+{ "type": "dictate_abort", "thread": "claude", "source": "web" }
 ```
 
 ## State machine
@@ -138,28 +209,31 @@ re-fire after the user dismisses the current one.
 
 ## Chip classification
 
-The daemon picks chip labels by pattern-matching `lastAssistant`:
+The host mux sets `awaiting` on `thread_idle` / `hud_yank`:
 
-| Pattern | Chips |
-|---|---|
-| Ends with `?` or contains "should I" / "would you like" | `yes` · `no` · `tell me more` · `dismiss` |
-| Matches `\b[yY]/[nN]\b` or "approve this" / "allow" | `approve` · `deny` · `dismiss` |
-| Otherwise (just finished work) | `continue` · `looks good` · `ask follow-up` · `dismiss` |
+| `awaiting` | Peek chips (2-up) | Action |
+|---|---|---|
+| `permission` | `approve` · `deny` | `input` with `y` / `n` |
+| `question` | `yes` · `dictate` | `input` yes, or `dictate_*` for custom text |
+| `done` | `continue` · `verify` | `input` with preset phrases |
 
-Each chip maps to an `input` payload:
+Each chip maps to an `input` payload (except `dictate`, which opens
+phone/web STT and ends in `dictate_commit`):
 
 | Chip | `text` | `enter` |
 |---|---|---|
 | `yes` | `yes` | true |
-| `no` | `no` | true |
 | `approve` | `y` | true |
 | `deny` | `n` | true |
 | `continue` | `continue` | true |
-| `looks good` | `looks good, thanks` | true |
-| `tell me more` | `tell me more` | true |
-| `ask follow-up` | — | (opens chip picker, no immediate send) |
-| `dismiss` | — | (close session, no send) |
-| `snooze` | — | (re-fire after SNOOZE_MS) |
+| `verify` | `please verify the tasks are completed` | true |
+| `dictate` | — | (`dictate_begin` → `dictate_commit`) |
+
+Follow-up picker (after `verify` / expanded card): `change it`, `explain more`,
+`what's next?`, plus agent-tuned extras (`fix errors` for codex,
+`continue task` for claude).
+
+Hardware back / timeout dismisses the peek without sending.
 
 ## DAT-side rendering hints
 
@@ -174,7 +248,9 @@ SDK is the reference; iOS mirrors it). Compact card layout:
 │ Done — pushed to main. Want    │   ← BODY text, 16dp, PRIMARY color
 │ me to open a PR?               │
 │                                │
-│ [ open ] [ snooze ] [ dismiss ]│   ← buttons: PRIMARY · SECONDARY · OUTLINE
+│ [ yes ] [ dictate ]            │   ← question: PRIMARY · SECONDARY
+│ [ continue ] [ verify ]        │   ← done: PRIMARY · SECONDARY
+│ [ approve ] [ deny ]           │   ← permission
 └────────────────────────────────┘
 ```
 

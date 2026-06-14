@@ -24,16 +24,25 @@ import (
 	"errors"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/maceip/ambient-link-core/host/internal/delivery"
 )
 
 // Reaper is the subset of *mux.Mux the watcher needs.
 type Reaper interface {
 	MarkDead(sessionID string)
+}
+
+// TargetRegistrar receives live PID/session correlation for delivery adapters.
+type TargetRegistrar interface {
+	Set(ep delivery.Endpoint)
+	Remove(sessionID string)
 }
 
 // ProcConfig configures the watcher.
@@ -46,7 +55,11 @@ type ProcConfig struct {
 	// LsofPath / PsPath override the binaries the watcher exec's.
 	LsofPath string
 	PsPath   string
-	Logger   *slog.Logger
+	// Registry receives pid/tty correlation for delivery. Optional.
+	Registry TargetRegistrar
+	// OnSessionLive is called after a session_id is correlated to a live PID.
+	OnSessionLive func(sessionID string)
+	Logger        *slog.Logger
 }
 
 // ProcWatcher watches process lifecycle and marks orphaned sessions dead.
@@ -65,7 +78,7 @@ func NewProcWatcher(r Reaper, cfg ProcConfig) (*ProcWatcher, error) {
 		cfg.PollInterval = 5 * time.Second
 	}
 	if len(cfg.AgentNames) == 0 {
-		cfg.AgentNames = []string{"claude", "codex"}
+		cfg.AgentNames = []string{"claude", "codex", "agent", "cursor-agent"}
 	}
 	if cfg.LsofPath == "" {
 		cfg.LsofPath = "lsof"
@@ -111,33 +124,47 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 		}
 		for sid := range sessions {
 			w.r.MarkDead(sid)
+			if w.cfg.Registry != nil {
+				w.cfg.Registry.Remove(sid)
+			}
 		}
 		delete(w.live, pid)
 	}
 	w.mu.Unlock()
 
 	// Refresh PID → session set for live PIDs.
-	for pid := range pids {
+	for pid, comm := range pids {
 		sessions := w.sessionsFor(ctx, pid)
 		if len(sessions) == 0 {
 			continue
 		}
+		tty := ttyForPID(ctx, w.cfg.PsPath, pid)
+		agent := agentFromCommand(comm)
 		w.mu.Lock()
 		w.live[pid] = sessions
 		w.mu.Unlock()
+		if w.cfg.Registry == nil {
+			continue
+		}
+		for sid := range sessions {
+			w.cfg.Registry.Set(delivery.Endpoint{
+				SessionID: sid,
+				PID:       pid,
+				TTY:       tty,
+				Agent:     agent,
+			})
+			if w.cfg.OnSessionLive != nil {
+				w.cfg.OnSessionLive(sid)
+			}
+		}
 	}
 }
 
-// listAgentPIDs returns pid → cmdline for every live process whose comm
-// matches one of cfg.AgentNames.
+// listAgentPIDs returns pid → command for processes that look like coding agents.
 func (w *ProcWatcher) listAgentPIDs(ctx context.Context) (map[int]string, error) {
-	out, err := exec.CommandContext(ctx, w.cfg.PsPath, "-A", "-o", "pid=,comm=").Output()
+	out, err := exec.CommandContext(ctx, w.cfg.PsPath, "-A", "-o", "pid=,command=").Output()
 	if err != nil {
 		return nil, err
-	}
-	wanted := make(map[string]bool, len(w.cfg.AgentNames))
-	for _, n := range w.cfg.AgentNames {
-		wanted[n] = true
 	}
 	result := make(map[int]string)
 	sc := bufio.NewScanner(strings.NewReader(string(out)))
@@ -146,7 +173,6 @@ func (w *ProcWatcher) listAgentPIDs(ctx context.Context) (map[int]string, error)
 		if line == "" {
 			continue
 		}
-		// pid + whitespace + comm (may itself contain a path on Linux).
 		i := strings.IndexAny(line, " \t")
 		if i < 0 {
 			continue
@@ -155,16 +181,29 @@ func (w *ProcWatcher) listAgentPIDs(ctx context.Context) (map[int]string, error)
 		if err != nil {
 			continue
 		}
-		comm := strings.TrimSpace(line[i:])
-		base := comm
-		if slash := strings.LastIndex(comm, "/"); slash >= 0 {
-			base = comm[slash+1:]
-		}
-		if wanted[base] {
-			result[pid] = comm
+		cmd := strings.TrimSpace(line[i:])
+		if looksLikeAgentProcess(cmd) {
+			result[pid] = cmd
 		}
 	}
 	return result, sc.Err()
+}
+
+func looksLikeAgentProcess(cmd string) bool {
+	cmd = strings.ToLower(cmd)
+	// macOS comm is truncated; match full command instead.
+	if strings.Contains(cmd, "/cursor-agent/") || strings.Contains(cmd, " cursor-agent") {
+		return true
+	}
+	if strings.Contains(cmd, "/.local/bin/agent") || strings.HasSuffix(cmd, " agent") {
+		return true
+	}
+	for _, name := range []string{"claude", "codex"} {
+		if strings.Contains(cmd, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionUUID matches the canonical "session id" segment in Claude Code's
@@ -172,9 +211,11 @@ func (w *ProcWatcher) listAgentPIDs(ctx context.Context) (map[int]string, error)
 // or ~/.claude/projects/<sanitized-cwd>/<uuid>/...
 var sessionUUID = regexp.MustCompile(`/\.claude/projects/[^/]+/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b`)
 
-// sessionsFor returns the set of session UUIDs the given PID has open files
-// against. Empty result is normal — agents only hold an open fd on the
-// session JSONL they're actively writing to.
+var codexSessionUUID = regexp.MustCompile(`([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$`)
+
+// Cursor Agent CLI keeps session state under ~/.cursor/chats/<hash>/<uuid>/store.db
+var cursorChatsSessionUUID = regexp.MustCompile(`/\.cursor/chats/[^/]+/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/store\.db`)
+
 func (w *ProcWatcher) sessionsFor(ctx context.Context, pid int) map[string]struct{} {
 	out, err := exec.CommandContext(ctx, w.cfg.LsofPath, "-nP", "-p", strconv.Itoa(pid), "-Fn").Output()
 	if err != nil {
@@ -189,11 +230,62 @@ func (w *ProcWatcher) sessionsFor(ctx context.Context, pid int) map[string]struc
 			continue
 		}
 		path := line[1:]
-		m := sessionUUID.FindStringSubmatch(path)
-		if m == nil {
+		if m := sessionUUID.FindStringSubmatch(path); m != nil {
+			sessions[m[1]] = struct{}{}
 			continue
 		}
-		sessions[m[1]] = struct{}{}
+		if strings.Contains(path, "/.codex/sessions/") {
+			if m := codexSessionUUID.FindStringSubmatch(path); m != nil {
+				sessions[m[1]] = struct{}{}
+			}
+			continue
+		}
+		if m := cursorTranscriptDir.FindStringSubmatch(path); m != nil {
+			base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+			if base == m[1] {
+				sessions[m[1]] = struct{}{}
+			}
+			continue
+		}
+		if m := cursorChatsSessionUUID.FindStringSubmatch(path); m != nil {
+			sessions[m[1]] = struct{}{}
+		}
 	}
 	return sessions
+}
+
+func ttyForPID(ctx context.Context, psPath string, pid int) string {
+	out, err := exec.CommandContext(ctx, psPath, "-p", strconv.Itoa(pid), "-o", "tty=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func agentBase(comm string) string {
+	base := comm
+	if slash := strings.LastIndex(comm, "/"); slash >= 0 {
+		base = comm[slash+1:]
+	}
+	if sp := strings.IndexAny(base, " \t"); sp > 0 {
+		base = base[:sp]
+	}
+	return base
+}
+
+func agentFromCommand(cmd string) string {
+	low := strings.ToLower(cmd)
+	if strings.Contains(low, "cursor-agent") || strings.Contains(low, "/.local/bin/agent") {
+		return "cursor"
+	}
+	base := agentBase(cmd)
+	switch base {
+	case "claude", "codex", "cursor-agent", "agent":
+		if base == "agent" || base == "cursor-agent" {
+			return "cursor"
+		}
+		return base
+	default:
+		return base
+	}
 }

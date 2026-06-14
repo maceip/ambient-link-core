@@ -216,6 +216,7 @@ func installClaudeHooks(path, hostURL, token string) (bool, error) {
 		{"PreToolUse", ""},
 		{"PostToolUse", ""},
 		{"Notification", "permission_prompt"},
+		{"PermissionRequest", ""},
 		{"Stop", ""},
 		{"SubagentStop", ""},
 	}

@@ -53,8 +53,10 @@ const (
 	// FormatClaude is Claude Code's per-line shape (sessionId, type, message).
 	FormatClaude JSONLFormat = "claude"
 	// FormatCodex is Codex CLI's per-line shape (timestamp, type, payload).
-	// Session ID is not repeated per line — extracted from the filename.
 	FormatCodex JSONLFormat = "codex"
+	// FormatCursor is Cursor Agent CLI transcripts under
+	// ~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl
+	FormatCursor JSONLFormat = "cursor"
 )
 
 // JSONLConfig configures the tailer.
@@ -142,6 +144,8 @@ func NewJSONLTailer(ing Ingester, cfg JSONLConfig) (*JSONLTailer, error) {
 		switch cfg.Format {
 		case FormatCodex:
 			cfg.Agent = "codex"
+		case FormatCursor:
+			cfg.Agent = "cursor"
 		default:
 			cfg.Agent = "claude"
 		}
@@ -234,11 +238,17 @@ func (t *JSONLTailer) handleFsEvent(ctx context.Context, ev fsnotify.Event) {
 			return
 		}
 		if strings.HasSuffix(ev.Name, ".jsonl") {
+			if !shouldTailCursorPath(t.cfg.Format, ev.Name) {
+				return
+			}
 			t.openFile(ctx, ev.Name, true) // skipExisting=true: new file, start at 0
 		}
 
 	case ev.Op&fsnotify.Write != 0:
 		if strings.HasSuffix(ev.Name, ".jsonl") {
+			if !shouldTailCursorPath(t.cfg.Format, ev.Name) {
+				return
+			}
 			t.openFile(ctx, ev.Name, false) // existing file write: pick up at EOF
 		}
 
@@ -270,6 +280,9 @@ func (t *JSONLTailer) scanAndOpen(root string) {
 			return nil
 		}
 		if !strings.HasSuffix(p, ".jsonl") {
+			return nil
+		}
+		if t.cfg.Format == FormatCursor && !shouldTailCursorPath(t.cfg.Format, p) {
 			return nil
 		}
 		info, err := d.Info()
@@ -405,6 +418,8 @@ func (t *JSONLTailer) dispatchLine(file string, line string) {
 	switch t.cfg.Format {
 	case FormatCodex:
 		t.dispatchCodex(file, line)
+	case FormatCursor:
+		t.dispatchCursor(file, line)
 	default:
 		t.dispatchClaude(line)
 	}
@@ -547,8 +562,119 @@ func codexSessionIDFromPath(file string) string {
 
 var codexFileUUID = regexp.MustCompile(`([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$`)
 
-// payloadString pulls a string field from a json.RawMessage payload. Used
-// to keep parsing cheap without unmarshaling into a typed struct.
+var cursorTranscriptDir = regexp.MustCompile(`/agent-transcripts/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/`)
+
+var cursorProjectDir = regexp.MustCompile(`/\.cursor/projects/([^/]+)/agent-transcripts/`)
+
+func shouldTailCursorPath(format JSONLFormat, path string) bool {
+	if format != FormatCursor {
+		return true
+	}
+	if strings.Contains(path, "/subagents/") {
+		return false
+	}
+	return cursorSessionIDFromPath(path) != ""
+}
+
+func (t *JSONLTailer) dispatchCursor(file, line string) {
+	sid := cursorSessionIDFromPath(file)
+	if sid == "" {
+		return
+	}
+	var rec cursorRecord
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		t.cfg.Logger.Debug("jsonl: bad cursor line", "err", err)
+		return
+	}
+	eventType, payload := classifyCursor(&rec)
+	if eventType == "" {
+		return
+	}
+	cwd := cursorCWDFromPath(file)
+	_ = t.ing.Ingest(proto.Event{
+		SessionID: sid, Agent: t.cfg.Agent, CWD: cwd,
+		Type: eventType, Payload: payload,
+		Source: proto.ProducerJSONL, ObservedAt: time.Now().UnixMilli(),
+	})
+}
+
+type cursorRecord struct {
+	Role    string          `json:"role"`
+	Message json.RawMessage `json:"message"`
+}
+
+func classifyCursor(rec *cursorRecord) (proto.EventType, any) {
+	switch rec.Role {
+	case "user":
+		return proto.EventUserPrompt, cursorMessageText(rec.Message)
+	case "assistant":
+		return proto.EventAssistantMessage, map[string]any{"message": cursorMessageText(rec.Message)}
+	}
+	return "", nil
+}
+
+func cursorMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range m.Content {
+		if c.Type != "text" || c.Text == "" || isCursorRedactedSnippet(c.Text) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(c.Text)
+	}
+	return b.String()
+}
+
+// Cursor JSONL often interleaves tool_use blocks with placeholder text chunks.
+func isCursorRedactedSnippet(s string) bool {
+	return strings.TrimSpace(s) == "[REDACTED]"
+}
+
+func cursorSessionIDFromPath(file string) string {
+	m := cursorTranscriptDir.FindStringSubmatch(file)
+	if m == nil {
+		return ""
+	}
+	id := m[1]
+	base := strings.TrimSuffix(filepath.Base(file), ".jsonl")
+	if base != id {
+		return ""
+	}
+	return id
+}
+
+func cursorCWDFromPath(file string) string {
+	m := cursorProjectDir.FindStringSubmatch(file)
+	if m == nil {
+		return ""
+	}
+	slug := m[1]
+	if !strings.HasPrefix(slug, "Users-") {
+		return ""
+	}
+	body := strings.TrimPrefix(slug, "Users-")
+	i := strings.Index(body, "-")
+	if i < 0 {
+		return ""
+	}
+	return filepath.Join("/Users", body[:i], body[i+1:])
+}
+
+// payloadString pulls a string field from a json.RawMessage payload.
 func payloadString(p json.RawMessage, key string) (string, bool) {
 	if len(p) == 0 {
 		return "", false

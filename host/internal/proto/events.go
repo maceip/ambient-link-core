@@ -1,8 +1,7 @@
 // Package proto defines the wire types shared between producers, the
 // SessionMux, and downstream WS clients (notably the iOS / Android relay
 // apps that fan events onto the glasses). Keep this in sync with
-// protocol/PROTOCOL.md. The Node prototype at relay-node-prototype/
-// is being phased out in favor of this Go host.
+// protocol/PROTOCOL.md.
 package proto
 
 // EventType is the closed enum of normalized session events that producers
@@ -78,6 +77,7 @@ const (
 	BroadcastThreadBusy    BroadcastType = "thread_busy"
 	BroadcastThreadIdle    BroadcastType = "thread_idle"
 	BroadcastThreadEnded   BroadcastType = "thread_ended"
+	BroadcastHudYank       BroadcastType = "hud_yank"
 )
 
 // Broadcast is the envelope written to every connected WS client. Optional
@@ -90,7 +90,8 @@ type Broadcast struct {
 	Agent            string        `json:"agent,omitempty"`
 	CWD              string        `json:"cwd,omitempty"`
 	LastAssistant    string        `json:"lastAssistant,omitempty"`
-	Awaiting         string        `json:"awaiting,omitempty"` // "permission" | "reply"
+	LastUserInput    string        `json:"lastUserInput,omitempty"`
+	Awaiting         string        `json:"awaiting,omitempty"` // "permission" | "question" | "done"
 	PermissionPrompt string        `json:"permissionPrompt,omitempty"`
 	Inferred         bool          `json:"inferred,omitempty"`
 	At               int64         `json:"at"`

@@ -1,13 +1,9 @@
 # Go
 host/bin/
+bin/
 host/dist/
 host/*.test
 host/*.out
-
-# Node prototype
-relay-node-prototype/node_modules/
-relay-node-prototype/etc/vapid.json
-relay-node-prototype/etc/subs.json
 
 # Local config
 local.properties

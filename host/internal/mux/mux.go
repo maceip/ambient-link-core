@@ -82,7 +82,7 @@ func WithDefaults(opt Options) Options {
 		opt.DedupWindow = 2500 * time.Millisecond
 	}
 	if opt.IdleDebounce == 0 {
-		opt.IdleDebounce = 2 * time.Second
+		opt.IdleDebounce = 4 * time.Second
 	}
 	if opt.MaxAssistantSnippet == 0 {
 		opt.MaxAssistantSnippet = 4096
@@ -179,7 +179,7 @@ func (m *Mux) Ingest(ev proto.Event) error {
 
 	if isNew {
 		m.broadcastLocked(proto.Broadcast{
-			Type:   proto.BroadcastThreadStarted,
+			Type: proto.BroadcastThreadStarted,
 			Thread: s.threadID, Label: s.label, Agent: s.agent, CWD: s.cwd,
 			At: ev.ObservedAt,
 		})
@@ -248,6 +248,7 @@ func (m *Mux) Snapshot() []SessionView {
 		out = append(out, SessionView{
 			SessionID:   s.id,
 			ThreadID:    s.threadID,
+			Label:       s.label,
 			Agent:       s.agent,
 			CWD:         s.cwd,
 			State:       s.state,
@@ -258,11 +259,123 @@ func (m *Mux) Snapshot() []SessionView {
 	return out
 }
 
+// ThreadMeta is the per-thread row in the WS hello payload.
+type ThreadMeta struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Agent string `json:"agent"`
+}
+
+// ThreadsHello returns one entry per live thread (non-DEAD sessions), using the
+// most recently active session when multiple share a thread id.
+func (m *Mux) ThreadsHello() []ThreadMeta {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	best := make(map[string]*session)
+	for _, s := range m.sessions {
+		if s.state == proto.StateDead {
+			continue
+		}
+		if cur, ok := best[s.threadID]; !ok || s.lastEventAt > cur.lastEventAt {
+			best[s.threadID] = s
+		}
+	}
+	out := make([]ThreadMeta, 0, len(best))
+	for _, s := range best {
+		out = append(out, ThreadMeta{ID: s.threadID, Label: s.label, Agent: s.agent})
+	}
+	return out
+}
+
+// YankForThread builds a hud_yank / thread_idle-shaped payload from live mux
+// state for the given thread id. Returns false when the thread is unknown.
+func (m *Mux) YankForThread(threadID string) (proto.Broadcast, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.bestSessionLocked(threadID)
+	if s == nil {
+		return proto.Broadcast{}, false
+	}
+	return m.yankFromSession(s), true
+}
+
+// SessionForThread returns the best live session for a thread id. Used by the
+// inject layer to resolve thread_id → session_id + agent for delivery.
+func (m *Mux) SessionForThread(threadID string) (sessionID, agent string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.bestSessionLocked(threadID)
+	if s == nil {
+		return "", "", false
+	}
+	return s.id, s.agent, true
+}
+
+// IngestUserInput records a HUD chip / composer reply for a live thread.
+func (m *Mux) IngestUserInput(threadID, text string) error {
+	m.mu.Lock()
+	s := m.bestSessionLocked(threadID)
+	m.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("mux: unknown thread %q", threadID)
+	}
+	if err := m.Ingest(proto.Event{
+		SessionID:  s.id,
+		Agent:      s.agent,
+		CWD:        s.cwd,
+		Type:       proto.EventUserPrompt,
+		Payload:    map[string]any{"message": text},
+		Source:     proto.ProducerHooks,
+		ObservedAt: time.Now().UnixMilli(),
+	}); err != nil && err != ErrDuplicate {
+		return err
+	}
+	return nil
+}
+
+func (m *Mux) bestSessionLocked(threadID string) *session {
+	tset, ok := m.threads[threadID]
+	if !ok || len(tset) == 0 {
+		return nil
+	}
+	var best *session
+	for sid := range tset {
+		s := m.sessions[sid]
+		if s == nil || s.state == proto.StateDead {
+			continue
+		}
+		if best == nil || s.lastEventAt > best.lastEventAt {
+			best = s
+		}
+	}
+	return best
+}
+
+func (m *Mux) yankFromSession(s *session) proto.Broadcast {
+	perm := ""
+	awaiting := idleAwaitingFor(s)
+	if s.state == proto.StateAwaitingPermission {
+		perm = s.lastPermissionPrompt
+	}
+	return proto.Broadcast{
+		Type:             proto.BroadcastHudYank,
+		Thread:           s.threadID,
+		Label:            s.label,
+		Agent:            s.agent,
+		LastAssistant:    s.lastAssistant,
+		LastUserInput:    s.lastUserInput,
+		Awaiting:         awaiting,
+		PermissionPrompt: perm,
+		At:               time.Now().UnixMilli(),
+	}
+}
+
 // SessionView is the diagnostic-friendly export shape; never includes large
 // buffered snippets.
 type SessionView struct {
 	SessionID   string             `json:"session_id"`
 	ThreadID    string             `json:"thread_id"`
+	Label       string             `json:"label"`
 	Agent       string             `json:"agent"`
 	CWD         string             `json:"cwd"`
 	State       proto.SessionState `json:"state"`
@@ -327,7 +440,8 @@ func (m *Mux) emitTransitionLocked(s *session, state proto.SessionState, at int6
 		// Don't clear idle timer here; the post-transition arm in Ingest will
 		// reset it after broadcasting.
 		m.broadcastLocked(proto.Broadcast{
-			Type: proto.BroadcastThreadBusy, Thread: s.threadID, SessionID: s.id, At: at,
+			Type: proto.BroadcastThreadBusy,
+			Thread: s.threadID, SessionID: s.id, Label: s.label, Agent: s.agent, At: at,
 		})
 	case proto.StateAwaitingPermission:
 		s.clearIdleTimer()
@@ -335,9 +449,12 @@ func (m *Mux) emitTransitionLocked(s *session, state proto.SessionState, at int6
 			Type:             proto.BroadcastThreadIdle,
 			Thread:           s.threadID,
 			SessionID:        s.id,
+			Label:            s.label,
+			Agent:            s.agent,
 			Awaiting:         "permission",
 			PermissionPrompt: s.lastPermissionPrompt,
 			LastAssistant:    s.lastAssistant,
+			LastUserInput:    s.lastUserInput,
 			At:               at,
 		})
 	case proto.StateIdle:
@@ -346,8 +463,11 @@ func (m *Mux) emitTransitionLocked(s *session, state proto.SessionState, at int6
 			Type:          proto.BroadcastThreadIdle,
 			Thread:        s.threadID,
 			SessionID:     s.id,
-			Awaiting:      "reply",
+			Label:         s.label,
+			Agent:         s.agent,
+			Awaiting:      idleAwaitingFor(s),
 			LastAssistant: s.lastAssistant,
+			LastUserInput: s.lastUserInput,
 			At:            at,
 		})
 	case proto.StateDead:
@@ -376,8 +496,11 @@ func (m *Mux) inferIdle(sessionID string) {
 		Type:          proto.BroadcastThreadIdle,
 		Thread:        s.threadID,
 		SessionID:     s.id,
-		Awaiting:      "reply",
+		Label:         s.label,
+		Agent:         s.agent,
+		Awaiting:      idleAwaitingFor(s),
 		LastAssistant: s.lastAssistant,
+		LastUserInput: s.lastUserInput,
 		Inferred:      true,
 		At:            time.Now().UnixMilli(),
 	})
@@ -459,6 +582,7 @@ type session struct {
 	lastEventAt           int64
 	lastSource            proto.ProducerName
 	lastAssistant         string
+	lastUserInput         string
 	lastPermissionPrompt string
 
 	idleTimer *time.Timer
@@ -489,11 +613,15 @@ func (s *session) absorb(ev *proto.Event, opt *Options) {
 			s.state = proto.StateIdle
 		}
 	case proto.EventAssistantMessage:
-		if txt := extractText(ev.Payload); txt != "" {
+		if txt := stripRedactedSnippets(extractText(ev.Payload)); txt != "" {
 			s.lastAssistant = clip(txt, opt.MaxAssistantSnippet)
+			s.lastUserInput = ""
 		}
 		s.state = proto.StateBusy
 	case proto.EventUserPrompt, proto.EventToolUse:
+		if txt := stripRedactedSnippets(extractText(ev.Payload)); txt != "" {
+			s.lastUserInput = clip(txt, opt.MaxAssistantSnippet)
+		}
 		s.state = proto.StateBusy
 	case proto.EventPermissionPrompt:
 		if txt := extractText(ev.Payload); txt != "" {
@@ -572,6 +700,25 @@ func clip(s string, n int) string {
 	return s[:n]
 }
 
+// stripRedactedSnippets drops Cursor transcript placeholder lines so HUD
+// cards keep the last human-readable assistant text.
+func stripRedactedSnippets(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if strings.TrimSpace(line) == "[REDACTED]" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func shortCWD(p string) string {
 	if p == "" {
 		return ""
@@ -581,4 +728,35 @@ func shortCWD(p string) string {
 		return "~" + p[len(home):]
 	}
 	return p
+}
+
+// idleAwaitingFor classifies why the agent surfaced on the HUD.
+func idleAwaitingFor(s *session) string {
+	if s.state == proto.StateAwaitingPermission {
+		return "permission"
+	}
+	if asksQuestion(s.lastAssistant) {
+		return "question"
+	}
+	return "done"
+}
+
+func asksQuestion(text string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(text))
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasSuffix(trimmed, "?") {
+		return true
+	}
+	cues := []string{
+		"should i", "would you like", "do you want", "shall i", "can you",
+		"will you", "yes or no", "y/n", "tap yes", "ready?",
+	}
+	for _, c := range cues {
+		if strings.Contains(trimmed, c) {
+			return true
+		}
+	}
+	return false
 }
