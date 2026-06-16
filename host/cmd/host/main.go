@@ -182,9 +182,11 @@ func runServe() error {
 	})
 	root.HandleFunc("/ambient-link/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		outbox, _ := box.Snapshot()
 		writeJSON(w, map[string]any{
 			"sessions":    m.Snapshot(),
 			"delivery":    reg.Snapshot(),
+			"outbox":      outbox,
 			"relay_debug": *relayDebug,
 			"journal":     jlog.Head(),
 			"now":         time.Now().UnixMilli(),
@@ -275,12 +277,13 @@ func runServe() error {
 			http.Error(w, "thread and text required", http.StatusBadRequest)
 			return
 		}
-		if err := inject.SendInput(req.Thread, req.Text, enter); err != nil {
+		result, err := inject.SendInputResult(req.Thread, req.Text, enter, "")
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		_ = m.IngestUserInput(req.Thread, req.Text)
-		writeJSON(w, map[string]string{"ok": "input"})
+		writeJSON(w, map[string]any{"ok": "input", "delivery": result})
 	})
 	if *webRoot != "" {
 		if st, err := os.Stat(*webRoot); err != nil || !st.IsDir() {
@@ -336,6 +339,19 @@ func runServe() error {
 	procW, err := producers.NewProcWatcher(m, producers.ProcConfig{
 		Logger:   logger,
 		Registry: reg,
+		LiveSessions: func() []producers.LiveSession {
+			views := m.Snapshot()
+			out := make([]producers.LiveSession, 0, len(views))
+			for _, v := range views {
+				out = append(out, producers.LiveSession{
+					SessionID: v.SessionID,
+					Agent:     v.Agent,
+					CWD:       v.CWD,
+					State:     v.State,
+				})
+			}
+			return out
+		},
 		OnSessionLive: func(sessionID string) {
 			if delivery.RetryPending(sessionID, reg, box) {
 				logger.Info("delivery: retry on live session", "session", sessionID)

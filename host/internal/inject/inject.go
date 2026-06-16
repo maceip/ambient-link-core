@@ -34,16 +34,26 @@ func Init(l SessionLookup, reg *delivery.Registry, box *delivery.Outbox) {
 
 // SendInput delivers text for the given thread.
 func SendInput(threadID, text string, enter bool) error {
+	_, err := SendInputResult(threadID, text, enter, "")
+	return err
+}
+
+// SendInputResult delivers text and returns a quiet delivery status for
+// clients that track reliability without blocking the user's flow.
+func SendInputResult(threadID, text string, enter bool, messageID string) (delivery.Result, error) {
+	var result delivery.Result
 	if lookup == nil || outbox == nil {
-		return fmt.Errorf("inject: not initialized")
+		return result, fmt.Errorf("inject: not initialized")
 	}
 	sessionID, agent, ok := lookup.SessionForThread(threadID)
 	if !ok {
-		return fmt.Errorf("inject: unknown thread %q", threadID)
+		result.ThreadID = threadID
+		result.ID = messageID
+		return result, fmt.Errorf("inject: unknown thread %q", threadID)
 	}
-	err := delivery.Deliver(sessionID, threadID, agent, text, enter, targets, outbox)
+	result, err := delivery.DeliverWithResult(sessionID, threadID, agent, text, enter, targets, outbox, messageID)
 	delivery.FlushPending(targets, outbox)
-	return err
+	return result, err
 }
 
 // SendSpecial delivers a single key (e.g. y/n for permission prompts).

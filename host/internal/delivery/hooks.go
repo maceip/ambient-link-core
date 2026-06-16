@@ -7,13 +7,14 @@ func HookResponse(hookEvent, sessionID string, raw map[string]any, box *Outbox) 
 	if box == nil || sessionID == "" {
 		return nil
 	}
-	msg, ok := box.Dequeue(sessionID)
+	msg, ok := box.Peek(sessionID)
 	if !ok {
 		return nil
 	}
+	var resp map[string]any
 	switch hookEvent {
 	case "Stop", "SubagentStop":
-		return map[string]any{
+		resp = map[string]any{
 			"decision": "block",
 			"reason":   msg.Text,
 		}
@@ -22,7 +23,7 @@ func HookResponse(hookEvent, sessionID string, raw map[string]any, box *Outbox) 
 		if behavior == "" {
 			return nil
 		}
-		return map[string]any{
+		resp = map[string]any{
 			"hookSpecificOutput": map[string]any{
 				"hookEventName": "PermissionRequest",
 				"decision": map[string]any{
@@ -31,7 +32,7 @@ func HookResponse(hookEvent, sessionID string, raw map[string]any, box *Outbox) 
 			},
 		}
 	case "UserPromptSubmit":
-		return map[string]any{
+		resp = map[string]any{
 			"hookSpecificOutput": map[string]any{
 				"hookEventName":     "UserPromptSubmit",
 				"additionalContext": "Ambient Link HUD reply: " + msg.Text,
@@ -40,6 +41,10 @@ func HookResponse(hookEvent, sessionID string, raw map[string]any, box *Outbox) 
 	default:
 		return nil
 	}
+	if resp != nil {
+		_, _ = box.Dequeue(sessionID)
+	}
+	return resp
 }
 
 func permissionBehavior(text string) string {

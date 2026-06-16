@@ -270,12 +270,13 @@ func (h *Hub) fanout(except *client, payload []byte) {
 
 func (h *Hub) handleInbound(from *client, data []byte) {
 	var msg struct {
-		Type   string           `json:"type"`
-		Thread string           `json:"thread"`
-		Text   string           `json:"text"`
-		Enter  *bool            `json:"enter"`
-		Key    string           `json:"key"`
-		Since  map[string]int64 `json:"since"`
+		Type     string           `json:"type"`
+		Thread   string           `json:"thread"`
+		Text     string           `json:"text"`
+		Enter    *bool            `json:"enter"`
+		Key      string           `json:"key"`
+		ClientID string           `json:"client_id"`
+		Since    map[string]int64 `json:"since"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		h.logger.Warn("hub: bad client frame", "err", err)
@@ -292,9 +293,29 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 		if msg.Enter != nil {
 			enter = *msg.Enter
 		}
-		if err := inject.SendInput(msg.Thread, msg.Text, enter); err != nil {
+		result, err := inject.SendInputResult(msg.Thread, msg.Text, enter, msg.ClientID)
+		if err != nil {
 			h.logger.Warn("hub: inject failed", "thread", msg.Thread, "err", err)
+			h.sendInputStatus(from, inputStatusMessage{
+				Type:   "input_status",
+				ID:     msg.ClientID,
+				Thread: msg.Thread,
+				Status: "failed",
+				Error:  err.Error(),
+				At:     time.Now().UnixMilli(),
+			})
+			return
 		}
+		h.sendInputStatus(from, inputStatusMessage{
+			Type:         "input_status",
+			ID:           msg.ClientID,
+			Thread:       result.ThreadID,
+			SessionID:    result.SessionID,
+			Status:       result.Status,
+			PendingCount: result.PendingCount,
+			Error:        result.Error,
+			At:           time.Now().UnixMilli(),
+		})
 		h.mu.RLock()
 		src := h.mux
 		h.mu.RUnlock()
@@ -317,6 +338,18 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 	default:
 		h.logger.Debug("hub: ignored client message", "type", msg.Type)
 	}
+}
+
+func (h *Hub) sendInputStatus(to *client, msg inputStatusMessage) {
+	if to == nil {
+		return
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		h.logger.Warn("hub: input status marshal", "err", err)
+		return
+	}
+	to.enqueue(payload)
 }
 
 func (h *Hub) replayJournal(to *client, since map[string]int64) {
@@ -386,6 +419,17 @@ type helloThread struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
 	Agent string `json:"agent"`
+}
+
+type inputStatusMessage struct {
+	Type         string `json:"type"`
+	ID           string `json:"id,omitempty"`
+	Thread       string `json:"thread,omitempty"`
+	SessionID    string `json:"session_id,omitempty"`
+	Status       string `json:"status"`
+	PendingCount int    `json:"pending_count,omitempty"`
+	Error        string `json:"error,omitempty"`
+	At           int64  `json:"at"`
 }
 
 // ── per-client state ────────────────────────────────────────────────────

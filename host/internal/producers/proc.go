@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/maceip/ambient-link-core/host/internal/delivery"
+	"github.com/maceip/ambient-link-core/host/internal/proto"
 )
 
 // Reaper is the subset of *mux.Mux the watcher needs.
@@ -43,6 +44,15 @@ type Reaper interface {
 type TargetRegistrar interface {
 	Set(ep delivery.Endpoint)
 	Remove(sessionID string)
+}
+
+// LiveSession is the watcher-facing subset of mux session state. It is used as
+// a Windows fallback where lsof-style open-file correlation is unavailable.
+type LiveSession struct {
+	SessionID string
+	Agent     string
+	CWD       string
+	State     proto.SessionState
 }
 
 // ProcConfig configures the watcher.
@@ -57,6 +67,9 @@ type ProcConfig struct {
 	PsPath   string
 	// Registry receives pid/tty correlation for delivery. Optional.
 	Registry TargetRegistrar
+	// LiveSessions supplies current mux sessions for platform fallbacks that
+	// cannot inspect process open files. Optional.
+	LiveSessions func() []LiveSession
 	// OnSessionLive is called after a session_id is correlated to a live PID.
 	OnSessionLive func(sessionID string)
 	Logger        *slog.Logger
@@ -114,6 +127,10 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 		w.cfg.Logger.Warn("proc: ps failed", "err", err)
 		return
 	}
+	agentProcessCounts := make(map[string]int)
+	for _, comm := range pids {
+		agentProcessCounts[normalizeAgentName(agentFromCommand(comm))]++
+	}
 
 	// Reap: any PID we had before that isn't in the current list — its
 	// sessions are dead.
@@ -134,12 +151,15 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 
 	// Refresh PID → session set for live PIDs.
 	for pid, comm := range pids {
+		agent := agentFromCommand(comm)
 		sessions := w.sessionsFor(ctx, pid)
+		if len(sessions) == 0 && useWindowsProcSupport {
+			sessions = w.sessionsForUniqueLiveAgent(agent, agentProcessCounts[normalizeAgentName(agent)])
+		}
 		if len(sessions) == 0 {
 			continue
 		}
 		tty := ttyForPID(ctx, w.cfg.PsPath, pid)
-		agent := agentFromCommand(comm)
 		w.mu.Lock()
 		w.live[pid] = sessions
 		w.mu.Unlock()
@@ -162,6 +182,9 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 
 // listAgentPIDs returns pid → command for processes that look like coding agents.
 func (w *ProcWatcher) listAgentPIDs(ctx context.Context) (map[int]string, error) {
+	if useWindowsProcSupport {
+		return w.listAgentPIDsWindows(ctx)
+	}
 	out, err := exec.CommandContext(ctx, w.cfg.PsPath, "-A", "-o", "pid=,command=").Output()
 	if err != nil {
 		return nil, err
@@ -254,6 +277,29 @@ func (w *ProcWatcher) sessionsFor(ctx context.Context, pid int) map[string]struc
 	return sessions
 }
 
+func (w *ProcWatcher) sessionsForUniqueLiveAgent(agent string, agentProcessCount int) map[string]struct{} {
+	if w.cfg.LiveSessions == nil || agentProcessCount != 1 {
+		return nil
+	}
+	want := normalizeAgentName(agent)
+	if want == "" {
+		return nil
+	}
+	var matches []LiveSession
+	for _, s := range w.cfg.LiveSessions() {
+		if s.SessionID == "" || s.State == proto.StateDead {
+			continue
+		}
+		if normalizeAgentName(s.Agent) == want {
+			matches = append(matches, s)
+		}
+	}
+	if len(matches) != 1 {
+		return nil
+	}
+	return map[string]struct{}{matches[0].SessionID: {}}
+}
+
 func ttyForPID(ctx context.Context, psPath string, pid int) string {
 	out, err := exec.CommandContext(ctx, psPath, "-p", strconv.Itoa(pid), "-o", "tty=").Output()
 	if err != nil {
@@ -264,13 +310,13 @@ func ttyForPID(ctx context.Context, psPath string, pid int) string {
 
 func agentBase(comm string) string {
 	base := comm
-	if slash := strings.LastIndex(comm, "/"); slash >= 0 {
+	if slash := strings.LastIndexAny(comm, `/\`); slash >= 0 {
 		base = comm[slash+1:]
 	}
 	if sp := strings.IndexAny(base, " \t"); sp > 0 {
 		base = base[:sp]
 	}
-	return base
+	return strings.Trim(base, `"'`)
 }
 
 func agentFromCommand(cmd string) string {
@@ -278,7 +324,7 @@ func agentFromCommand(cmd string) string {
 	if strings.Contains(low, "cursor-agent") || strings.Contains(low, "/.local/bin/agent") {
 		return "cursor"
 	}
-	base := agentBase(cmd)
+	base := normalizeAgentName(agentBase(cmd))
 	switch base {
 	case "claude", "codex", "cursor-agent", "agent":
 		if base == "agent" || base == "cursor-agent" {
@@ -288,4 +334,14 @@ func agentFromCommand(cmd string) string {
 	default:
 		return base
 	}
+}
+
+func normalizeAgentName(agent string) string {
+	agent = strings.TrimSpace(strings.ToLower(agent))
+	agent = strings.Trim(agent, `"'`)
+	agent = strings.TrimSuffix(agent, ".exe")
+	if agent == "cursor-agent" || agent == "agent" {
+		return "cursor"
+	}
+	return agent
 }

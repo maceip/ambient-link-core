@@ -1,29 +1,31 @@
 // JSONL tailer producer.
 //
 // Claude Code persists every session's events to
-//   ~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl
+//
+//	~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl
+//
 // appended in real time. The tailer:
 //
-//   1. Recursively discovers existing .jsonl files under the root at startup.
-//   2. Uses fsnotify on the root subtree to spot new sessions / new directories.
-//   3. For each file, runs a tail loop that consumes newly-appended bytes and
-//      parses one JSON record per line.
-//   4. Maps each record to a normalized proto.Event and hands it to the
-//      Ingester. The mux dedupes against hook events of the same session.
+//  1. Recursively discovers existing .jsonl files under the root at startup.
+//  2. Uses fsnotify on the root subtree to spot new sessions / new directories.
+//  3. For each file, runs a tail loop that consumes newly-appended bytes and
+//     parses one JSON record per line.
+//  4. Maps each record to a normalized proto.Event and hands it to the
+//     Ingester. The mux dedupes against hook events of the same session.
 //
 // Properties:
 //   - Catches sessions that have no hook config installed.
 //   - Survives file rotation: if a file shrinks (unlikely) we reset to start.
-//   - Survives daemon restarts: we re-scan and resume at file end (we don't
-//     replay history — the mux derives state from "current and going forward",
-//     not "all time").
+//   - Survives daemon restarts: we re-scan recent files and replay a bounded
+//     tail so active sessions are visible without waiting for the next write.
 //   - Bounded work: one tail goroutine per active file, capped by maxOpen.
 //   - Never blocks the ingester: per-file goroutines send into a buffered
 //     channel that the dispatcher drains into mux.Ingest.
 //
 // JSONL schema (Claude Code, observed on local box):
-//   { sessionId, cwd, version, type: "user"|"assistant"|"tool_use"|"summary"|"system",
-//     message: { role, content }, timestamp?, ... }
+//
+//	{ sessionId, cwd, version, type: "user"|"assistant"|"tool_use"|"summary"|"system",
+//	  message: { role, content }, timestamp?, ... }
 package producers
 
 import (
@@ -83,7 +85,10 @@ type JSONLConfig struct {
 	// older than this is skipped at startup. fsnotify Write events still
 	// re-attach if the file later sees activity. Default 1 hour.
 	StaleAge time.Duration
-	Logger   *slog.Logger
+	// StartupReplayBytes is the bounded tail replay used for initial scan.
+	// Default 1 MiB. New files still start at byte 0.
+	StartupReplayBytes int64
+	Logger             *slog.Logger
 }
 
 // JSONLTailer runs the tailing pipeline.
@@ -162,6 +167,9 @@ func NewJSONLTailer(ing Ingester, cfg JSONLConfig) (*JSONLTailer, error) {
 	}
 	if cfg.StaleAge == 0 {
 		cfg.StaleAge = time.Hour
+	}
+	if cfg.StartupReplayBytes == 0 {
+		cfg.StartupReplayBytes = 1024 * 1024
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -242,7 +250,7 @@ func (t *JSONLTailer) handleFsEvent(ctx context.Context, ev fsnotify.Event) {
 			if !shouldTailCursorPath(t.cfg.Format, ev.Name) {
 				return
 			}
-			t.openFile(ctx, ev.Name, true) // skipExisting=true: new file, start at 0
+			t.openFile(ctx, ev.Name, true, 0) // new file, start at 0
 		}
 
 	case ev.Op&fsnotify.Write != 0:
@@ -250,7 +258,7 @@ func (t *JSONLTailer) handleFsEvent(ctx context.Context, ev fsnotify.Event) {
 			if !shouldTailCursorPath(t.cfg.Format, ev.Name) {
 				return
 			}
-			t.openFile(ctx, ev.Name, false) // existing file write: pick up at EOF
+			t.openFile(ctx, ev.Name, false, 0) // existing file write: pick up at EOF
 		}
 
 	case ev.Op&fsnotify.Remove != 0, ev.Op&fsnotify.Rename != 0:
@@ -270,10 +278,10 @@ func (t *JSONLTailer) watchTree(root string) error {
 	})
 }
 
-// scanAndOpen attaches to files written within StaleAge — historical .jsonl
-// files (subagent dumps, old sessions) are skipped here to keep the open-fd
-// budget for actually-active sessions. If a stale file later gets a Write
-// event from fsnotify, openFile will pick it up then.
+// scanAndOpen attaches to files written within StaleAge and replays a bounded
+// tail so daemon restarts recover recent session state. Historical .jsonl files
+// are skipped to keep the open-fd budget for actually-active sessions. If a
+// stale file later gets a Write event from fsnotify, openFile will pick it up.
 func (t *JSONLTailer) scanAndOpen(root string) {
 	cutoff := time.Now().Add(-t.cfg.StaleAge)
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -290,12 +298,12 @@ func (t *JSONLTailer) scanAndOpen(root string) {
 		if err != nil || info.ModTime().Before(cutoff) {
 			return nil
 		}
-		t.openFile(context.Background(), p, false)
+		t.openFile(context.Background(), p, false, t.cfg.StartupReplayBytes)
 		return nil
 	})
 }
 
-func (t *JSONLTailer) openFile(ctx context.Context, path string, fromStart bool) {
+func (t *JSONLTailer) openFile(ctx context.Context, path string, fromStart bool, replayBytes int64) {
 	t.mu.Lock()
 	if t.stopped {
 		t.mu.Unlock()
@@ -317,7 +325,7 @@ func (t *JSONLTailer) openFile(ctx context.Context, path string, fromStart bool)
 		}
 		return
 	}
-	ft := &fileTail{path: path, fromStart: fromStart, done: make(chan struct{})}
+	ft := &fileTail{path: path, fromStart: fromStart, replayBytes: replayBytes, done: make(chan struct{})}
 	t.open[path] = ft
 	t.wg.Add(1)
 	t.mu.Unlock()
@@ -352,10 +360,8 @@ func (t *JSONLTailer) closeAll() {
 	}
 }
 
-// tailLoop owns one file. It seeks to EOF (unless fromStart=true), then
-// reads in 4 KiB chunks, splitting on newlines and dispatching each parsed
-// record. Returns when the file goes idle for FileIdleClose, when stop is
-// signalled, or when ctx is done.
+// tailLoop owns one file. It seeks to EOF, byte 0, or a bounded replay window,
+// then reads appended JSONL records until the file goes idle or ctx is done.
 func (t *JSONLTailer) tailLoop(ctx context.Context, ft *fileTail) {
 	defer t.wg.Done()
 	defer func() {
@@ -371,14 +377,41 @@ func (t *JSONLTailer) tailLoop(ctx context.Context, ft *fileTail) {
 	}
 	defer f.Close()
 
+	if t.cfg.Format == FormatCodex && !ft.fromStart {
+		t.primeCodexCWD(ft.path)
+	}
+
+	discardPartial := false
 	if !ft.fromStart {
-		if _, err := f.Seek(0, io.SeekEnd); err != nil {
-			t.cfg.Logger.Warn("jsonl: seek end failed", "path", ft.path, "err", err)
-			return
+		if ft.replayBytes > 0 {
+			info, err := f.Stat()
+			if err != nil {
+				t.cfg.Logger.Warn("jsonl: stat failed", "path", ft.path, "err", err)
+				return
+			}
+			start := info.Size() - ft.replayBytes
+			if start > 0 {
+				if _, err := f.Seek(start, io.SeekStart); err != nil {
+					t.cfg.Logger.Warn("jsonl: seek replay failed", "path", ft.path, "err", err)
+					return
+				}
+				discardPartial = true
+			} else if _, err := f.Seek(0, io.SeekStart); err != nil {
+				t.cfg.Logger.Warn("jsonl: seek start failed", "path", ft.path, "err", err)
+				return
+			}
+		} else {
+			if _, err := f.Seek(0, io.SeekEnd); err != nil {
+				t.cfg.Logger.Warn("jsonl: seek end failed", "path", ft.path, "err", err)
+				return
+			}
 		}
 	}
 
 	rd := bufio.NewReaderSize(f, 64*1024)
+	if discardPartial {
+		_, _ = rd.ReadString('\n')
+	}
 	idleSince := time.Now()
 	poll := time.NewTicker(t.cfg.PollFallbackInterval)
 	defer poll.Stop()
@@ -487,6 +520,32 @@ func (t *JSONLTailer) dispatchCodex(file, line string) {
 		Type: eventType, Payload: eventPayload,
 		Source: proto.ProducerJSONL, ObservedAt: at,
 	})
+}
+
+func (t *JSONLTailer) primeCodexCWD(file string) {
+	if t.codexState.getCWD(file) != "" {
+		return
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	rd := bufio.NewReaderSize(io.LimitReader(f, 4*1024*1024), 64*1024)
+	line, err := rd.ReadString('\n')
+	if err != nil && line == "" {
+		return
+	}
+	var rec codexRecord
+	if err := json.Unmarshal([]byte(strings.TrimRight(line, "\r\n")), &rec); err != nil {
+		return
+	}
+	if rec.Type != "session_meta" {
+		return
+	}
+	if cwd, _ := payloadString(rec.Payload, "cwd"); cwd != "" {
+		t.codexState.setCWD(file, cwd)
+	}
 }
 
 // classifyClaude maps Claude's record types into normalized events.
@@ -697,10 +756,11 @@ func payloadString(p json.RawMessage, key string) (string, bool) {
 
 // fileTail tracks one open .jsonl file.
 type fileTail struct {
-	path      string
-	fromStart bool
-	done      chan struct{}
-	once      sync.Once
+	path        string
+	fromStart   bool
+	replayBytes int64
+	done        chan struct{}
+	once        sync.Once
 }
 
 func (ft *fileTail) stop() {

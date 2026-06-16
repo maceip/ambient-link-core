@@ -16,38 +16,80 @@ func SetLogger(l *slog.Logger) {
 	}
 }
 
+const (
+	StatusDelivered = "delivered"
+	StatusQueued    = "queued"
+)
+
+// Result describes what happened to a reply after the relay accepted it. It is
+// meant for diagnostics and quiet client tracking, not blocking UI flow.
+type Result struct {
+	ID           string `json:"id,omitempty"`
+	SessionID    string `json:"session_id"`
+	ThreadID     string `json:"thread"`
+	Status       string `json:"status"`
+	PendingCount int    `json:"pending_count,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
 // Deliver routes a user reply into a live terminal session. Tries adapters in
-// order; on failure stores one pending message per session for background retry.
+// order; on failure stores a pending message for background retry.
 func Deliver(sessionID, threadID, agent, text string, enter bool, reg *Registry, box *Outbox) error {
+	_, err := DeliverWithResult(sessionID, threadID, agent, text, enter, reg, box, "")
+	return err
+}
+
+// DeliverWithResult is Deliver plus a structured status for callers that track
+// delivery internally.
+func DeliverWithResult(sessionID, threadID, agent, text string, enter bool, reg *Registry, box *Outbox, messageID string) (Result, error) {
+	result := Result{ID: messageID, SessionID: sessionID, ThreadID: threadID}
 	if box == nil {
-		return fmt.Errorf("delivery: nil outbox")
+		return result, fmt.Errorf("delivery: nil outbox")
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return fmt.Errorf("delivery: empty text")
+		return result, fmt.Errorf("delivery: empty text")
+	}
+	msg := Message{
+		ID: messageID, SessionID: sessionID, ThreadID: threadID, Text: text, Enter: enter,
+		At: time.Now().UnixMilli(),
 	}
 	agent = strings.ToLower(strings.TrimSpace(agent))
 	if agent == "web" {
-		return box.Enqueue(Message{
-			SessionID: sessionID, ThreadID: threadID, Text: text, Enter: enter,
-			At: time.Now().UnixMilli(),
-		})
-	}
-	if err := TryImmediate(sessionID, text, enter, reg); err == nil {
-		if box.HasPending(sessionID) {
-			_, _ = box.Dequeue(sessionID)
+		if err := box.Enqueue(msg); err != nil {
+			return result, err
 		}
-		return nil
+		result.Status = StatusQueued
+		result.PendingCount = box.Count(sessionID)
+		return result, nil
 	}
-	if pending, ok := box.Peek(sessionID); ok && pending.Text == text && pending.Enter == enter {
-		logger.Debug("delivery: already queued", "session", sessionID, "thread", threadID)
-		return nil
+
+	// Preserve ordering. If earlier replies are waiting, this reply joins the
+	// queue instead of jumping ahead via an immediate adapter.
+	if box.HasPending(sessionID) {
+		if err := box.Enqueue(msg); err != nil {
+			return result, err
+		}
+		result.Status = StatusQueued
+		result.PendingCount = box.Count(sessionID)
+		return result, nil
 	}
-	logger.Info("delivery: queued for retry", "session", sessionID, "thread", threadID)
-	return box.Enqueue(Message{
-		SessionID: sessionID, ThreadID: threadID, Text: text, Enter: enter,
-		At: time.Now().UnixMilli(),
-	})
+
+	if err := TryImmediate(sessionID, text, enter, reg); err == nil {
+		result.Status = StatusDelivered
+		return result, nil
+	} else {
+		msg.LastError = err.Error()
+		if enqueueErr := box.Enqueue(msg); enqueueErr != nil {
+			result.Error = enqueueErr.Error()
+			return result, enqueueErr
+		}
+		result.Status = StatusQueued
+		result.PendingCount = box.Count(sessionID)
+		result.Error = err.Error()
+		logger.Info("delivery: queued for retry", "session", sessionID, "thread", threadID, "err", err)
+		return result, nil
+	}
 }
 
 // TryImmediate runs terminal adapters when proc correlation has a live endpoint.
@@ -59,17 +101,28 @@ func TryImmediate(sessionID, text string, enter bool, reg *Registry) error {
 	if !ok || ep.PID <= 0 {
 		return fmt.Errorf("delivery: no live endpoint for %s", sessionID)
 	}
+	var attempts []string
+	if err := SendProcessInput(ep.PID, text, enter); err == nil {
+		logger.Info("delivery: process input", "session", sessionID, "pid", ep.PID)
+		return nil
+	} else {
+		attempts = append(attempts, err.Error())
+	}
 	if err := SendTmuxPID(ep.PID, text, enter); err == nil {
 		logger.Info("delivery: tmux", "session", sessionID, "pid", ep.PID)
 		return nil
+	} else {
+		attempts = append(attempts, err.Error())
 	}
 	if ep.TTY != "" {
 		if err := WriteTTY(ep.TTY, text, enter); err == nil {
 			logger.Info("delivery: tty", "session", sessionID, "tty", ep.TTY)
 			return nil
+		} else {
+			attempts = append(attempts, err.Error())
 		}
 	}
-	return fmt.Errorf("delivery: adapters failed for %s", sessionID)
+	return fmt.Errorf("delivery: adapters failed for %s (%s)", sessionID, strings.Join(attempts, "; "))
 }
 
 // RetryPending attempts immediate delivery for one queued message.
@@ -77,16 +130,21 @@ func RetryPending(sessionID string, reg *Registry, box *Outbox) bool {
 	if box == nil || !box.HasPending(sessionID) {
 		return false
 	}
-	msg, ok := box.Peek(sessionID)
-	if !ok {
-		return false
+	delivered := false
+	for i := 0; i < 32; i++ {
+		msg, ok := box.Peek(sessionID)
+		if !ok {
+			return delivered
+		}
+		if err := TryImmediate(sessionID, msg.Text, msg.Enter, reg); err != nil {
+			box.MarkAttempt(sessionID, msg.ID, err)
+			return delivered
+		}
+		_, _ = box.Dequeue(sessionID)
+		logger.Info("delivery: retry ok", "session", sessionID, "thread", msg.ThreadID)
+		delivered = true
 	}
-	if TryImmediate(sessionID, msg.Text, msg.Enter, reg) != nil {
-		return false
-	}
-	_, _ = box.Dequeue(sessionID)
-	logger.Info("delivery: retry ok", "session", sessionID, "thread", msg.ThreadID)
-	return true
+	return delivered
 }
 
 // FlushPending retries queued messages for all sessions.
