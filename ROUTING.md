@@ -168,8 +168,14 @@ ambient-link-snapchat                  SNAP-SPECIFIC
    path dependency and re-exports it (Foundation Models / App Intents / visionOS stay
    Apple-specific). `relay-ios` still has loose Swift sources with no in-repo build
    file — its `GlassLink.swift` folds in once that target gets a Package/xcodeproj.
-5. Promote SODA STT into `core-android` (decided); vendor apps consume it.
-   (meta `relay-android` already carries a recovered SODA engine — that's the source.)
+5. **Done (revised):** promote the **STT *contract*** (`SttEngine`) into
+   `core-android`, not the SODA binary. The recovered SODA `.jar`/`.so` are not in
+   git and aren't redistributable, so the engine (`SodaDictationEngine` +
+   `com.google.research.air.cosmo.lib.soda.*`) stays in `ambient-link-meta` as the
+   reference impl of `SttEngine`. Other vendors implement `SttEngine` over their own
+   recognizer (Android `SpeechRecognizer`, Apple `Speech`, Web Speech). A
+   `core-android-soda` AAR can host the SODA Kotlin layer later *if* the binaries are
+   ever vendored — kept separate so `core-android` stays native-free.
 
 Each step is independently shippable.
 

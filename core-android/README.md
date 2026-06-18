@@ -16,6 +16,7 @@ This is migration step 3 from [`../ROUTING.md`](../ROUTING.md).
 | `EphemeralBuffer<T>` | TTL ring buffer (Cosmo `InMemoryEphemeralBuffer`) |
 | `Throttle` | per-key leading-edge frame gate (Cosmo `FRAME_PROCESS_INTERVAL_MS`) |
 | `WearPaths` + status/trigger enums | `/ambientlink/...` data-layer protocol |
+| `SttEngine` | vendor-neutral streaming speech-to-text contract (begin → partial* → commit) |
 
 `kotlinx-coroutines` is exposed as `api`, so consumers get `StateFlow` transitively.
 
