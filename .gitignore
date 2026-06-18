@@ -6,6 +6,7 @@ host/*.test
 host/*.out
 host/*.exe
 *.exe
+*.exe~
 
 # Local config
 local.properties

@@ -131,7 +131,7 @@ ambient-link-core                      VENDOR-NEUTRAL ONLY
   host/             Go relay daemon (producers, delivery, sink, mux, journal, mdns, pair)
     dictate/        STT entry point  (+ SODA engine, promoted from meta — decided)
   tools/            relay-bridge, ws-check
-  (future) core-android/  shared Kotlin lib: RelayClient + SODA + GlassLink base
+  core-android/     shared Kotlin lib: RelayClient + Session + GlassLink + EphemeralBuffer + Throttle + WearPaths
   (future) core-apple/    shared Swift pkg (AmbientLinkKit graduates here)
 
 ambient-link-meta                      META-SPECIFIC
@@ -156,12 +156,20 @@ ambient-link-snapchat                  SNAP-SPECIFIC
 1. **Done:** move relay tooling + protocol test into core.
 2. **Done:** add `contracts/` to core; copy the contract into every vendor repo and
    make existing clients implement it.
-3. Extract `core-android` (RelayClient + SODA + `GlassLink` base) so meta/google/wear
-   stop duplicating `RelayClient`/`Session` (today tagged `TODO(shared)`).
+3. **Done:** extract `core-android` (`Session`, `RelayClient`, `GlassLink`,
+   `EphemeralBuffer`, `Throttle`, `WearPaths`). `ambient-link-google` (`:app` +
+   `:wear`) now consumes it via composite build and no longer duplicates
+   `RelayClient`/`Session`. Next: fold meta `relay-android` onto it.
 4. Graduate `AmbientLinkKit` into `core-apple`; meta-ios + apple depend on it.
-5. Promote SODA STT into core (decided); vendor apps consume it.
+5. Promote SODA STT into `core-android` (decided); vendor apps consume it.
 
 Each step is independently shippable and leaves every repo building.
+
+> **core-android consumption:** vendor repos add
+> `includeBuild("../ambient-link-core/core-android")` in `settings.gradle.kts` and
+> `implementation("com.ambientlink:core-android:0.1.0")` in the module. Gradle
+> substitutes the coordinate with the local build (no publish step). For CI/release,
+> `./gradlew publishToMavenLocal` and resolve from `mavenLocal()`.
 
 ---
 
