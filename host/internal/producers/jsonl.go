@@ -630,7 +630,7 @@ func shouldTailCursorPath(format JSONLFormat, path string) bool {
 	if format != FormatCursor {
 		return true
 	}
-	if strings.Contains(path, "/subagents/") {
+	if strings.Contains(filepath.ToSlash(path), "/subagents/") {
 		return false
 	}
 	return cursorSessionIDFromPath(path) != ""
@@ -705,7 +705,7 @@ func isCursorRedactedSnippet(s string) bool {
 }
 
 func cursorSessionIDFromPath(file string) string {
-	m := cursorTranscriptDir.FindStringSubmatch(file)
+	m := cursorTranscriptDir.FindStringSubmatch(filepath.ToSlash(file))
 	if m == nil {
 		return ""
 	}
@@ -718,11 +718,18 @@ func cursorSessionIDFromPath(file string) string {
 }
 
 func cursorCWDFromPath(file string) string {
-	m := cursorProjectDir.FindStringSubmatch(file)
+	m := cursorProjectDir.FindStringSubmatch(filepath.ToSlash(file))
 	if m == nil {
 		return ""
 	}
 	slug := m[1]
+	// Windows project slugs carry a leading drive-letter segment, e.g.
+	// "C-Users-mac-proj"; strip it so the "Users-" decode below applies.
+	if len(slug) >= 2 && slug[1] == '-' {
+		if c := slug[0]; (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			slug = slug[2:]
+		}
+	}
 	if !strings.HasPrefix(slug, "Users-") {
 		return ""
 	}

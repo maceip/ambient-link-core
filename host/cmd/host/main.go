@@ -175,6 +175,7 @@ func runServe() error {
 
 	root := http.NewServeMux()
 	root.Handle("/ambient-link/ws", hub)
+	root.Handle("/face-chat/ws", hub)
 	root.Handle("/ambient-link/hooks/", hooksHandler)
 	root.Handle("/ambient-link/ingest", ingestHandler)
 	root.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +192,25 @@ func runServe() error {
 			"journal":     jlog.Head(),
 			"now":         time.Now().UnixMilli(),
 		})
+	})
+	root.HandleFunc("/ambient-link/sessions", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, map[string]any{
+				"sessions": m.Snapshot(),
+				"now":      time.Now().UnixMilli(),
+			})
+		case http.MethodPost:
+			w.WriteHeader(http.StatusNotImplemented)
+			writeJSON(w, map[string]any{
+				"error": "session creation is not wired on this host yet; start the agent in a terminal first",
+			})
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			writeJSON(w, map[string]any{"error": "method not allowed"})
+		}
 	})
 	root.HandleFunc("/ambient-link/pair", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -391,6 +411,7 @@ func runServe() error {
 			"addr", *listen,
 			"endpoints", []string{
 				"/ambient-link/ws",
+				"/face-chat/ws",
 				"/ambient-link/ingest",
 				"/ambient-link/pair",
 				"/ambient-link/hooks/claude",
