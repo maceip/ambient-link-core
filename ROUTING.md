@@ -132,7 +132,7 @@ ambient-link-core                      VENDOR-NEUTRAL ONLY
     dictate/        STT entry point  (+ SODA engine, promoted from meta — decided)
   tools/            relay-bridge, ws-check
   core-android/     shared Kotlin lib: RelayClient + Session + GlassLink + EphemeralBuffer + Throttle + WearPaths
-  (future) core-apple/    shared Swift pkg (AmbientLinkKit graduates here)
+  core-apple/       shared Swift pkg (AmbientLinkCore): same surface for Apple platforms
 
 ambient-link-meta                      META-SPECIFIC
   web/              Ray-Ban Display web app
@@ -162,7 +162,12 @@ ambient-link-snapchat                  SNAP-SPECIFIC
    `ambient-link-meta/relay-android` consumes it from mavenLocal and dropped its
    `GlassLink` copy. meta's `RelayClient` stays vendor-specific (WS/OkHttp, not the
    polling client).
-4. Graduate `AmbientLinkKit` into `core-apple`; meta-ios + apple depend on it.
+4. **Done:** graduate the shared Swift into `core-apple` (`AmbientLinkCore`:
+   `Session`, `RelayClient`, `SessionStore`, `GlassLink`, `EphemeralBuffer`,
+   `Throttle`). `ambient-link-apple`'s `AmbientLinkKit` depends on it via a SwiftPM
+   path dependency and re-exports it (Foundation Models / App Intents / visionOS stay
+   Apple-specific). `relay-ios` still has loose Swift sources with no in-repo build
+   file — its `GlassLink.swift` folds in once that target gets a Package/xcodeproj.
 5. Promote SODA STT into `core-android` (decided); vendor apps consume it.
    (meta `relay-android` already carries a recovered SODA engine — that's the source.)
 
