@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/maceip/ambient-link-core/host/internal/backpressure"
 )
 
 // Handler commits finalized dictation text and fans out live UI frames.
@@ -20,6 +22,14 @@ type Handler struct {
 
 	// Fanout broadcasts a JSON frame to all connected WS clients.
 	Fanout func(payload []byte)
+
+	// PartialThrottle gates the high-rate dictate_partial firehose per thread,
+	// applying the Cosmo frame-interval lesson (ROUTING.md): intermediate
+	// partials within the interval are dropped to keep the WS transit lean,
+	// while begin/commit/abort always pass and reset the gate. Nil disables
+	// throttling (every partial fans out). Commit always carries the full
+	// transcript, so dropped intermediate partials never lose data.
+	PartialThrottle *backpressure.Throttle
 }
 
 type session struct {
@@ -75,9 +85,15 @@ func (h *Handler) Handle(sessions *Sessions, raw []byte) {
 	switch msg.Type {
 	case MsgBegin:
 		sessions.begin(msg.Thread, msg.Source)
+		h.PartialThrottle.Reset(msg.Thread) // new turn: next partial passes immediately
 		h.emit(EvActive, msg.Thread, "", msg.Source)
 	case MsgPartial:
 		if msg.Text == "" {
+			return
+		}
+		// Drop intermediate partials inside the throttle window; the next
+		// commit carries the full text so nothing is lost.
+		if !h.PartialThrottle.Allow(msg.Thread, time.Now()) {
 			return
 		}
 		h.emit(EvPartial, msg.Thread, msg.Text, msg.Source)
@@ -86,6 +102,7 @@ func (h *Handler) Handle(sessions *Sessions, raw []byte) {
 			return
 		}
 		sessions.end(msg.Thread)
+		h.PartialThrottle.Reset(msg.Thread)
 		if h.Commit != nil {
 			if err := h.Commit(msg.Thread, msg.Text); err != nil && h.Logger != nil {
 				h.Logger.Warn("dictate: commit failed", "thread", msg.Thread, "err", err)
@@ -94,6 +111,7 @@ func (h *Handler) Handle(sessions *Sessions, raw []byte) {
 		h.emit(EvEnd, msg.Thread, msg.Text, msg.Source)
 	case MsgAbort:
 		sessions.end(msg.Thread)
+		h.PartialThrottle.Reset(msg.Thread)
 		h.emit(EvEnd, msg.Thread, "", msg.Source)
 	}
 }

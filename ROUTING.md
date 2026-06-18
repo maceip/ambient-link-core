@@ -80,6 +80,15 @@ surface ingests media:
 stream over a dedicated channel with explicit teardown. Never hold a connection a
 gate says should be off.
 
+**Realized in Go transit (tested):** `host/internal/backpressure` implements the two
+primitives — `EphemeralBuffer[T]` (TTL + max) and `Throttle` (per-key leading-edge
+gate) — with unit tests. The throttle is wired into the **dictation partial fan-out**
+(`host/internal/dictate`): the high-rate `dictate_partial` firehose is gated to
+~6.7/s per thread while `begin`/`commit`/`abort` always pass and reset the gate
+(commit carries the full transcript, so no data is lost). Verified live: a 30-partial
+burst over the WS collapsed to **1** fanned-out frame; the 9-test protocol
+conformance suite stays green against the rebuilt host.
+
 ---
 
 ## 4. Multi-source audio fan-in to one STT

@@ -14,6 +14,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/maceip/ambient-link-core/host/internal/backpressure"
 	"github.com/maceip/ambient-link-core/host/internal/dictate"
 	"github.com/maceip/ambient-link-core/host/internal/inject"
 	"github.com/maceip/ambient-link-core/host/internal/journal"
@@ -56,6 +57,10 @@ func NewHub(logger *slog.Logger) *Hub {
 		dictHandler: dictate.Handler{
 			Logger: logger,
 			Fanout: nil, // wired on first ServeHTTP via setDictateFanout
+			// Throttle the dictate_partial firehose to ~6.7 fps per thread
+			// (Cosmo frame-interval lesson). begin/commit/abort bypass this and
+			// reset the gate; commit carries full text so no data is lost.
+			PartialThrottle: backpressure.NewThrottle(150 * time.Millisecond),
 		},
 	}
 }

@@ -4,6 +4,8 @@ bin/
 host/dist/
 host/*.test
 host/*.out
+host/*.exe
+*.exe
 
 # Local config
 local.properties
