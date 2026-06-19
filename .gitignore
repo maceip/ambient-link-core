@@ -14,6 +14,10 @@ local.properties
 .env.*
 *.log
 
+# E2E artifacts
+e2e-webapp.png
+tools/e2e-webapp.png
+
 # OS
 .DS_Store
 Thumbs.db

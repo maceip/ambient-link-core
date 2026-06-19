@@ -6,7 +6,6 @@
 // Run: node tools/relay-bridge.mjs
 
 const LOCAL_HTTP = process.env.LOCAL_HTTP || 'http://127.0.0.1:5181';
-const LOCAL_WS = process.env.LOCAL_WS || 'ws://127.0.0.1:5181/ambient-link/ws';
 const REMOTE = process.env.REMOTE || 'https://public.computer';
 const POLL_MS = Number(process.env.POLL_MS || 15000);
 
@@ -27,48 +26,22 @@ async function postRemote(path, body) {
   }
 }
 
-// Pull the latest hud_yank card per thread (carries lastAssistant preview text).
-function pullCards(threadIds, journal) {
-  return new Promise((resolve) => {
-    const cards = {};
-    if (!threadIds.length) return resolve(cards);
-    let ws;
-    try { ws = new WebSocket(LOCAL_WS); } catch { return resolve(cards); }
-    const finish = () => { try { ws.close(); } catch {} resolve(cards); };
-    const timer = setTimeout(finish, 4000);
-    ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ type: 'subscribe', since: { journal: journal || 0 } }));
-    });
-    ws.addEventListener('message', (ev) => {
-      let m;
-      try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.type === 'hello') {
-        threadIds.forEach((th) => ws.send(JSON.stringify({ type: 'hud_yank', thread: th })));
-      } else if (m.type === 'hud_yank' && m.thread) {
-        cards[m.thread] = m;
-      }
-    });
-    ws.addEventListener('error', () => { clearTimeout(timer); finish(); });
-  });
-}
-
-function previewFor(session, card) {
-  if (card && card.lastAssistant) return String(card.lastAssistant).slice(0, 200);
+// The REST snapshot now carries the preview/last_assistant directly (data-plane
+// parity), so no WS card dance is needed — read it straight off /sessions.
+function previewFor(session) {
+  if (session.preview) return String(session.preview).slice(0, 200);
+  if (session.last_assistant) return String(session.last_assistant).slice(0, 200);
   if (session.state === 'BUSY') return 'thinking…';
   return '';
 }
 
 async function cycle() {
-  const [sessData, status] = await Promise.all([
-    getJSON(LOCAL_HTTP, '/ambient-link/sessions'),
-    getJSON(LOCAL_HTTP, '/ambient-link/status'),
-  ]);
+  const sessData = await getJSON(LOCAL_HTTP, '/ambient-link/sessions');
   const live = (sessData.sessions || []).filter((s) => s.state !== 'DEAD');
-  const cards = await pullCards(live.map((s) => s.thread_id), status.journal);
 
   let pushed = 0;
   for (const s of live) {
-    const message = previewFor(s, cards[s.thread_id]);
+    const message = previewFor(s);
     try {
       await postRemote('/ambient-link/ingest', {
         source: 'virtual',
