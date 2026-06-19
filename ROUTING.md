@@ -127,7 +127,7 @@ an explicit stop, exactly like `/cosmowear/mic_stream` + `/mic_stream_stop`.
 ```
 ambient-link-core                      VENDOR-NEUTRAL ONLY
   protocol/         relay wire protocol + conformance test
-  contracts/        GlassLink + EphemeralBuffer + wear-data-layer  (Kotlin/Swift/TS)
+  contracts/        glass-link.ts (no TS pkg yet) + wear-data-layer.md spec; Kotlin/Swift live in core-android / core-apple
   host/             Go relay daemon (producers, delivery, sink, mux, journal, mdns, pair)
     dictate/        STT entry point  (+ SODA engine, promoted from meta — decided)
   tools/            relay-bridge, ws-check
@@ -179,16 +179,15 @@ ambient-link-snapchat                  SNAP-SPECIFIC
 
 Each step is independently shippable.
 
-> **core-android consumption — two paths (AGP version decides):**
-> - *Composite build (no publish step):* when the consumer's AGP matches
->   core-android's (8.7) — e.g. `ambient-link-google`. Add
->   `includeBuild(".../core-android")` + `implementation("com.ambientlink:core-android:0.1.0")`;
->   Gradle substitutes the coordinate with the local build.
-> - *Published AAR (mavenLocal / GitHub Packages):* when AGP skews — e.g.
->   `ambient-link-meta` on AGP 8.6. AGP forbids two AGP versions in one composite
->   invocation, so consume the binary. One-time `./gradlew publishToMavenLocal` for
->   local dev; CI resolves from a real registry. (jvmTarget skew is irrelevant on
->   Android — everything dexes to one target.)
+> **core-android consumption — one mechanism (unified).** All Android consumers use
+> a **Gradle composite build**. Everyone is aligned on **AGP 8.7 / Kotlin 2.1.20 /
+> Gradle 8.14.1** (meta's proven wrapper was copied to `core-android` and
+> `ambient-link-google`, which previously had none), so a composite include works
+> with no version skew, no published artifact, and no `publishToMavenLocal` step —
+> cold-buildable everywhere.
+> - google: `includeBuild("../ambient-link-core/core-android")`
+> - meta:   `includeBuild("../../ambient-link-core/core-android")` (relay-android is a level deeper)
+> - `maven-publish` is retained on core-android for a future GitHub Packages registry (CI).
 
 ---
 

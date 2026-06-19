@@ -20,10 +20,11 @@ interface SttEngine {
     fun start()
 
     /**
-     * Stop capture/recognition. If [commitPartial] and a trailing partial exists,
-     * the impl should emit it as a final via [Callbacks.onFinal] before ending.
+     * Stop capture/recognition, committing any trailing partial as a final via
+     * [Callbacks.onFinal]. Impls that distinguish commit-vs-abort expose that as a
+     * richer overload (e.g. `stop(commitPartial: Boolean)`).
      */
-    fun stop(commitPartial: Boolean = true)
+    fun stop()
 
     /** Most recent uncommitted partial transcript, or "" if none. */
     fun lastPartialText(): String

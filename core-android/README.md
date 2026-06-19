@@ -22,11 +22,13 @@ This is migration step 3 from [`../ROUTING.md`](../ROUTING.md).
 
 ## Consuming it
 
-**Composite build (no publish step — recommended for local dev).** In the vendor
-repo's `settings.gradle.kts`:
+**One mechanism for all Android consumers: Gradle composite build (no publish step).**
+Everyone is aligned on **AGP 8.7 / Kotlin 2.1.20 / Gradle 8.14.1** so a composite
+include works without version skew. In the vendor repo's `settings.gradle.kts`:
 
 ```kotlin
-includeBuild("../ambient-link-core/core-android")
+includeBuild("../ambient-link-core/core-android")       // google (sibling)
+// includeBuild("../../ambient-link-core/core-android")  // meta (relay-android is one level deeper)
 ```
 
 and in the module `build.gradle.kts`:
@@ -37,10 +39,10 @@ implementation("com.ambientlink:core-android:0.1.0")
 
 Gradle substitutes the dependency with the local build automatically (matched on
 `com.ambientlink:core-android`). Requires `ambient-link-core` checked out as a
-sibling of the vendor repo.
+sibling of the vendor repo. No `publishToMavenLocal`, no registry, cold-buildable.
 
-**Maven (CI / release).** Publish once, then depend via `mavenLocal()` /
-your repo:
+**Maven (CI / release, optional).** The `maven-publish` config is retained for a
+future GitHub Packages registry:
 
 ```bash
 ./gradlew publishToMavenLocal

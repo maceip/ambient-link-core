@@ -12,14 +12,23 @@ public struct Session: Identifiable, Sendable, Codable, Hashable {
         case dead = "DEAD"
     }
 
+    public enum Awaiting: String, Sendable, Codable {
+        case permission, question, done
+    }
+
     public let sessionId: String
     public let agent: String          // "cursor" | "claude" | "codex"
     public let cwd: String
     public let state: State
     public let preview: String
+    public let awaiting: Awaiting
+    public let permissionPrompt: String
 
     public var id: String { sessionId }
     public var isLive: Bool { state != .dead }
+
+    /// True when the agent is blocked on the user (permission/question).
+    public var needsAttention: Bool { awaiting == .permission || awaiting == .question }
 
     /// Last path component of the working directory, for compact labels.
     public var shortCwd: String {
@@ -29,12 +38,15 @@ public struct Session: Identifiable, Sendable, Codable, Hashable {
 
     public var label: String { "\(agent): \(shortCwd)" }
 
-    public init(sessionId: String, agent: String, cwd: String, state: State, preview: String = "") {
+    public init(sessionId: String, agent: String, cwd: String, state: State,
+                preview: String = "", awaiting: Awaiting = .done, permissionPrompt: String = "") {
         self.sessionId = sessionId
         self.agent = agent
         self.cwd = cwd
         self.state = state
         self.preview = preview
+        self.awaiting = awaiting
+        self.permissionPrompt = permissionPrompt
     }
 }
 
@@ -48,6 +60,8 @@ extension Session {
             let cwd: String?
             let state: String?
             let preview: String?
+            let awaiting: String?
+            let permission_prompt: String?
         }
     }
 
@@ -59,7 +73,9 @@ extension Session {
                 agent: r.agent ?? "agent",
                 cwd: r.cwd ?? "",
                 state: Session.State(rawValue: r.state ?? "IDLE") ?? .idle,
-                preview: r.preview ?? ""
+                preview: r.preview ?? "",
+                awaiting: Session.Awaiting(rawValue: r.awaiting ?? "done") ?? .done,
+                permissionPrompt: r.permission_prompt ?? ""
             )
         }
     }

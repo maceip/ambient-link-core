@@ -13,8 +13,13 @@ data class Session(
     val cwd: String,
     val state: String,      // "BUSY" | "IDLE" | "DEAD"
     val preview: String = "",
+    val awaiting: String = "done",            // "permission" | "question" | "done"
+    val permissionPrompt: String = "",
 ) {
     val isLive: Boolean get() = state != "DEAD"
+
+    /** True when the agent is blocked on the user (permission/question). */
+    val needsAttention: Boolean get() = awaiting == "permission" || awaiting == "question"
 
     /** Last path component of cwd, for compact wrist/HUD labels. */
     val shortCwd: String get() = cwd.substringAfterLast('/').ifBlank { cwd }

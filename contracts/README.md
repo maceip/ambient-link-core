@@ -1,18 +1,18 @@
 # contracts
 
-Canonical, vendor-neutral contracts implemented by every Ambient Link surface.
-**Source of truth** — copy the matching language file into each vendor repo and
-implement it; do not fork the shape.
+Vendor-neutral contracts for Ambient Link. There is **one home per language**, and
+for Kotlin/Swift that home is now the shared library — not this directory.
 
-| File | Implemented by |
-|---|---|
-| `GlassLink.kt` / `EphemeralBuffer` | `ambient-link-google` (ProjectedXR), `ambient-link-meta/relay-android` (DAT) |
-| `GlassLink.swift` | `ambient-link-apple`, `ambient-link-meta/relay-ios` |
-| `glass-link.ts` | `ambient-link-snapchat` (Lens Studio) |
-| `wear-data-layer.md` | `ambient-link-google/wear` (phone-tethered path) |
+| Contract | Single source of truth | Implemented by |
+|---|---|---|
+| `GlassLink`, `EphemeralBuffer`, `Throttle`, `Session`, `RelayClient`, `WearPaths`, `SttEngine` | **`../core-android`** (`com.ambientlink.core`) | `ambient-link-google` (ProjectedXR); `ambient-link-meta/relay-android` (DAT + SODA `SttEngine`) |
+| same surface, Swift | **`../core-apple`** (`AmbientLinkCore`) | `ambient-link-apple`; `ambient-link-meta/relay-ios` |
+| `glass-link.ts` | **this dir** (no TS package yet) | `ambient-link-snapchat` (Lens Studio vendors the file) |
+| `wear-data-layer.md` | **this dir** (protocol spec, language-agnostic) | `ambient-link-google/wear` |
+
+Why TS still lives here: Lens Studio projects vendor `.ts` files rather than pull a
+package, so `glass-link.ts` stays a copy-pasteable header until/unless a `core-ts`
+npm package is worth it. The `.kt`/`.swift` copies that used to sit here have been
+deleted — import the library types instead.
 
 Rationale, perf patterns, and the repo reorg plan: see [`../ROUTING.md`](../ROUTING.md).
-
-These are intentionally header-only (interfaces/protocols + doc). They carry no
-vendor imports so they stay copy-pasteable. When `core-android` / `core-apple`
-shared libraries land, these graduate into real published modules.

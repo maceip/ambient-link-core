@@ -79,6 +79,8 @@ class RelayClient(
                 cwd = o.optString("cwd"),
                 state = o.optString("state", "IDLE"),
                 preview = o.optString("preview", ""),
+                awaiting = o.optString("awaiting", "done"),
+                permissionPrompt = o.optString("permission_prompt", ""),
             )
         }
     }

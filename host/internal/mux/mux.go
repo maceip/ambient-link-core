@@ -246,14 +246,19 @@ func (m *Mux) Snapshot() []SessionView {
 	out := make([]SessionView, 0, len(m.sessions))
 	for _, s := range m.sessions {
 		out = append(out, SessionView{
-			SessionID:   s.id,
-			ThreadID:    s.threadID,
-			Label:       s.label,
-			Agent:       s.agent,
-			CWD:         s.cwd,
-			State:       s.state,
-			LastEventAt: s.lastEventAt,
-			LastSource:  s.lastSource,
+			SessionID:        s.id,
+			ThreadID:         s.threadID,
+			Label:            s.label,
+			Agent:            s.agent,
+			CWD:              s.cwd,
+			State:            s.state,
+			LastEventAt:      s.lastEventAt,
+			LastSource:       s.lastSource,
+			Preview:          previewFor(s),
+			Awaiting:         idleAwaitingFor(s),
+			LastAssistant:    s.lastAssistant,
+			LastUserInput:    s.lastUserInput,
+			PermissionPrompt: s.lastPermissionPrompt,
 		})
 	}
 	return out
@@ -370,8 +375,11 @@ func (m *Mux) yankFromSession(s *session) proto.Broadcast {
 	}
 }
 
-// SessionView is the diagnostic-friendly export shape; never includes large
-// buffered snippets.
+// SessionView is the export shape for the REST /ambient-link/status snapshot.
+// It carries the same glanceable content the WS yank cards do (preview /
+// awaiting / permission prompt) so polling clients (glasses app, Wear, Apple)
+// reach parity with the WS surfaces instead of seeing metadata only. Snippets
+// are clipped by the mux's Max*Snippet bounds.
 type SessionView struct {
 	SessionID   string             `json:"session_id"`
 	ThreadID    string             `json:"thread_id"`
@@ -381,6 +389,13 @@ type SessionView struct {
 	State       proto.SessionState `json:"state"`
 	LastEventAt int64              `json:"last_event_at"`
 	LastSource  proto.ProducerName `json:"last_source"`
+
+	// Glanceable content (was previously WS-only).
+	Preview          string `json:"preview"`
+	Awaiting         string `json:"awaiting"`
+	LastAssistant    string `json:"last_assistant,omitempty"`
+	LastUserInput    string `json:"last_user_input,omitempty"`
+	PermissionPrompt string `json:"permission_prompt,omitempty"`
 }
 
 // ThreadIDFor is the pure function that maps (agent, cwd) → thread id.
@@ -728,6 +743,19 @@ func shortCWD(p string) string {
 		return "~" + p[len(home):]
 	}
 	return p
+}
+
+// previewFor is the single glanceable line for a session: the pending permission
+// prompt if one is blocking, otherwise the last assistant text, falling back to
+// the last user input. Mirrors what the WS yank cards show.
+func previewFor(s *session) string {
+	if s.state == proto.StateAwaitingPermission && s.lastPermissionPrompt != "" {
+		return s.lastPermissionPrompt
+	}
+	if s.lastAssistant != "" {
+		return s.lastAssistant
+	}
+	return s.lastUserInput
 }
 
 // idleAwaitingFor classifies why the agent surfaced on the HUD.
