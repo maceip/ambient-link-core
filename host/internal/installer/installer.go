@@ -412,11 +412,12 @@ func installLaunchAgent(name, binaryPath, hostURL, token string) (string, bool, 
   <array>
     <string>%s</string>
     <string>serve</string>
-    <string>-listen</string>
-    <string>%s</string>
-    <string>-token</string>
-    <string>%s</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AMBIENT_LINK_LISTEN</key><string>%s</string>
+    <key>AMBIENT_LINK_TOKEN</key><string>%s</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardErrorPath</key><string>%s/Library/Logs/%s.log</string>
@@ -461,14 +462,16 @@ Description=ambient-link host daemon
 After=network.target
 
 [Service]
-ExecStart=%s serve -listen %s -token %s
+ExecStart=%s serve
 Restart=on-failure
 RestartSec=5
 Environment=HOME=%s
+Environment=AMBIENT_LINK_LISTEN=%s
+Environment=AMBIENT_LINK_TOKEN=%s
 
 [Install]
 WantedBy=default.target
-`, binaryPath, urlListen(hostURL), token, home)
+`, binaryPath, home, urlListen(hostURL), token)
 	if existing, err := os.ReadFile(unitPath); err == nil && string(existing) == unit {
 		return unitPath, false, nil
 	}

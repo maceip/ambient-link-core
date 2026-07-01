@@ -214,12 +214,34 @@ func TestSweepStaleMarksDead(t *testing.T) {
 	// SweepStale(0) marks anything older than now as dead. With cutoff=now,
 	// the just-ingested session shouldn't be reaped. So pass a negative
 	// duration to make the cutoff in the future, ensuring it's reaped.
-	n := m.SweepStale(-time.Millisecond)
+	// Process is gone (isLive=false) → reaped.
+	n := m.SweepStale(-time.Millisecond, func(string) bool { return false })
 	if n != 1 {
 		t.Fatalf("want 1 reaped, got %d", n)
 	}
 	if got := sink.byType(proto.BroadcastThreadEnded); len(got) != 1 {
 		t.Fatalf("want 1 thread_ended, got %d", len(got))
+	}
+}
+
+// TestSweepStaleSkipsLiveSession is the regression guard for the G3 bug: an
+// idle/waiting session whose process is still alive must NEVER be reaped on a
+// timer, no matter how old (DECISIONS.md §5).
+func TestSweepStaleSkipsLiveSession(t *testing.T) {
+	m, sink := newTestMux(t, Options{IdleDebounce: 20 * time.Millisecond})
+
+	_ = m.Ingest(ev(proto.EventStop, "alive-1", "claude", "/p", nil))
+	// Cutoff in the future (negative idle) would normally reap, but isLive=true.
+	n := m.SweepStale(-time.Millisecond, func(string) bool { return true })
+	if n != 0 {
+		t.Fatalf("a live session must not be reaped, got %d", n)
+	}
+	if got := sink.byType(proto.BroadcastThreadEnded); len(got) != 0 {
+		t.Fatalf("live session must not emit thread_ended, got %d", len(got))
+	}
+	// And with a nil predicate, nothing is swept (death is proc-driven only).
+	if n := m.SweepStale(-time.Millisecond, nil); n != 0 {
+		t.Fatalf("nil predicate must sweep nothing, got %d", n)
 	}
 }
 

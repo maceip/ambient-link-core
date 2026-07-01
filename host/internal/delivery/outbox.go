@@ -24,7 +24,6 @@ type Message struct {
 	SessionID string `json:"session_id"`
 	ThreadID  string `json:"thread"`
 	Text      string `json:"text"`
-	Enter     bool   `json:"enter"`
 	At        int64  `json:"at"`
 	Attempts  int    `json:"attempts,omitempty"`
 	LastError string `json:"last_error,omitempty"`
@@ -36,7 +35,6 @@ type PendingMessage struct {
 	ID        string `json:"id,omitempty"`
 	SessionID string `json:"session_id"`
 	ThreadID  string `json:"thread"`
-	Enter     bool   `json:"enter"`
 	At        int64  `json:"at"`
 	Attempts  int    `json:"attempts,omitempty"`
 	LastError string `json:"last_error,omitempty"`
@@ -314,7 +312,6 @@ func (o *Outbox) Snapshot() ([]PendingSession, error) {
 				ID:        msg.ID,
 				SessionID: msg.SessionID,
 				ThreadID:  msg.ThreadID,
-				Enter:     msg.Enter,
 				At:        msg.At,
 				Attempts:  msg.Attempts,
 				LastError: msg.LastError,

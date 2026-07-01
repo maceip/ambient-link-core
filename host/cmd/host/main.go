@@ -2,14 +2,31 @@
 // the ambient-link mobile relays. It wires the SessionMux to three parallel
 // producers (hooks ingest, JSONL tailer, process watcher) and a WS sink.
 //
-// Usage:
+// Usage — just run it. `host` (or `host serve`) starts the daemon with sane
+// defaults and needs no flags. The rare overrides are environment variables so
+// the command line stays empty:
 //
-//	host serve         start the daemon (default)
+//	AMBIENT_LINK_LISTEN       bind address (default 0.0.0.0:5181)
+//	AMBIENT_LINK_TOKEN        bearer token for /hooks + WS (default: disabled)
+//	AMBIENT_LINK_LOG          log level: debug|info|warn|error (default info)
+//	AMBIENT_LINK_RELAY_DEBUG  1 to suppress auto idle/busy cards
+//	AMBIENT_LINK_WEB_ROOT     override path to the glasses web app to serve
+//	AMBIENT_LINK_CLOUD        wss:// cloud relay to bridge to (G5; off if unset)
+//	AMBIENT_LINK_HOME         state dir for relay.db + outbox (default ~/.ambient-link)
+//
+// Other subcommands:
+//
+//	host run <agent>   launch an agent under a relay-owned PTY (reliable delivery)
 //	host install       write hook configs and a launchd/systemd unit
 //	host uninstall     reverse of install
 //	host status        query a running daemon over its local HTTP API
 //
-// Run `host -h` for flags.
+// All agent↔human interaction is recorded in a local SQLite database
+// (~/.ambient-link/relay.db). The native app remains source of truth; the DB is
+// a durable, reconcilable mirror. See DECISIONS.md for the full rationale.
+//
+// Only one relay runs at a time: it binds the port as its lock and, if the port
+// is already taken, prints which PID to stop. It never kills another process.
 package main
 
 import (
@@ -20,24 +37,30 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/maceip/ambient-link-core/host/internal/cloud"
 	"github.com/maceip/ambient-link-core/host/internal/delivery"
 	"github.com/maceip/ambient-link-core/host/internal/discovery"
 	"github.com/maceip/ambient-link-core/host/internal/inject"
 	"github.com/maceip/ambient-link-core/host/internal/installer"
-	"github.com/maceip/ambient-link-core/host/internal/journal"
 	"github.com/maceip/ambient-link-core/host/internal/mux"
 	"github.com/maceip/ambient-link-core/host/internal/pair"
 	"github.com/maceip/ambient-link-core/host/internal/producers"
 	"github.com/maceip/ambient-link-core/host/internal/proto"
+	"github.com/maceip/ambient-link-core/host/internal/pty"
 	"github.com/maceip/ambient-link-core/host/internal/sink"
+	"github.com/maceip/ambient-link-core/host/internal/store"
 	"github.com/maceip/ambient-link-core/host/internal/webapp"
 )
 
@@ -71,6 +94,10 @@ func main() {
 		}
 	case "pair":
 		if err := runPair(); err != nil {
+			fatal(err)
+		}
+	case "run":
+		if err := runAgent(os.Args[1:]); err != nil {
 			fatal(err)
 		}
 	default:
@@ -136,38 +163,59 @@ func boolWord(b bool, yes, no string) string {
 }
 
 func runServe() error {
-	var (
-		listen          = flag.String("listen", defaultListen, "host:port for the HTTP+WS server")
-		token           = flag.String("token", "", "bearer token required on /ambient-link/hooks/* POSTs (empty = disabled)")
-		logLvl          = flag.String("log", "info", "log level: debug | info | warn | error")
-		relayDebug      = flag.Bool("relay-debug", false, "suppress auto thread_idle/busy to clients; explicit hud_yank only")
-		webRoot         = flag.String("web-root", defaultWebRoot(), "glasses companion SPA directory (empty = disabled)")
-		jsonlRoot       = flag.String("jsonl-root", defaultClaudeJSONLRoot(), "root of Claude Code session JSONL files; empty disables Claude JSONL tailer")
-		codexJSONLRoot  = flag.String("codex-jsonl-root", defaultCodexJSONLRoot(), "root of Codex session JSONL files; empty disables Codex JSONL tailer")
-		cursorJSONLRoot = flag.String("cursor-jsonl-root", defaultCursorJSONLRoot(), "root of Cursor Agent transcript JSONL; empty disables Cursor JSONL tailer")
-	)
 	flag.Parse()
 
-	logger := newLogger(*logLvl)
+	// No flags: bare `host` just works. The handful of rare overrides live in
+	// environment variables so the command line stays empty.
+	listen := envOr("AMBIENT_LINK_LISTEN", defaultListen)
+	token := os.Getenv("AMBIENT_LINK_TOKEN")
+	relayDebug := envBool("AMBIENT_LINK_RELAY_DEBUG")
+	webRoot := defaultWebRoot()
+	jsonlRoot := defaultClaudeJSONLRoot()
+	codexJSONLRoot := defaultCodexJSONLRoot()
+	cursorJSONLRoot := defaultCursorJSONLRoot()
+
+	logger := newLogger(envOr("AMBIENT_LINK_LOG", "info"))
+
+	// Single-instance lock — intentionally dumb. Binding the port IS the lock:
+	// if it's taken, another relay (or process) already owns it, so we say so
+	// and exit. No killing, no version arbitration. To run a newer build, stop
+	// the old one first. A lock file records our PID so the message can name it.
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		msg := fmt.Sprintf("cannot start: %s is already in use", listen)
+		if pid := readLockPID(); pid > 0 {
+			msg = fmt.Sprintf("a relay is already running (pid %d). Stop it first, then run `host` again.", pid)
+		}
+		fmt.Fprintln(os.Stderr, "host:", msg)
+		return nil
+	}
+	writeLock(listen)
+	defer removeLock()
+	logger.Info("relay: starting", "pid", os.Getpid(), "rev", buildRev(), "addr", listen)
 
 	hub := sink.NewHub(logger)
-	hub.SetBearerToken(*token)
-	hub.SetRelayDebug(*relayDebug)
-	jlog, err := journal.Open()
+	hub.SetBearerToken(token)
+	hub.SetRelayDebug(relayDebug)
+	st, err := store.Open()
 	if err != nil {
-		return fmt.Errorf("journal: %w", err)
+		return fmt.Errorf("store: %w", err)
 	}
-	hub.SetJournal(jlog)
+	defer st.Close()
+	logger.Info("store: opened", "path", st.Path())
+	hub.SetJournal(st)
 	m := mux.New(hub, mux.Options{Logger: logger})
 	hub.SetMux(m)
+
+	cfg := loadHostConfig()
 
 	reg := delivery.NewRegistry()
 	box := delivery.NewOutbox()
 	delivery.SetLogger(logger)
-	inject.Init(m, reg, box)
+	inject.Init(m, reg, box, st)
 
 	hooksHandler := producers.NewHooks(m, producers.HooksConfig{
-		BearerToken: *token,
+		BearerToken: token,
 		Logger:      logger,
 		Outbox:      box,
 	})
@@ -178,6 +226,8 @@ func runServe() error {
 	root.Handle("/face-chat/ws", hub)
 	root.Handle("/ambient-link/hooks/", hooksHandler)
 	root.Handle("/ambient-link/ingest", ingestHandler)
+	// Control channel for `host run <agent>` (relay-owned PTY mode).
+	root.Handle("/ambient-link/pty", &pty.ControlHandler{Logger: logger, Token: token})
 	root.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
@@ -188,10 +238,40 @@ func runServe() error {
 			"sessions":    m.Snapshot(),
 			"delivery":    reg.Snapshot(),
 			"outbox":      outbox,
-			"relay_debug": *relayDebug,
-			"journal":     jlog.Head(),
+			"relay_debug": relayDebug,
+			"journal":     st.Head(),
+			"db":          st.Path(),
+			"default_cwd": cfg.defaultCwd(),
 			"now":         time.Now().UnixMilli(),
+			// Observability only (no logic depends on these): answers
+			// "is the running relay current?".
+			"pid":     os.Getpid(),
+			"version": buildRev(),
 		})
+	})
+	// Cross-surface config. The Android app POSTs the default working directory
+	// here; the glasses web app reads it from /status to prefill a new session.
+	root.HandleFunc("/ambient-link/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, map[string]any{"default_cwd": cfg.defaultCwd()})
+		case http.MethodPost:
+			var body struct {
+				DefaultCwd string `json:"default_cwd"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			cfg.setDefaultCwd(strings.TrimSpace(body.DefaultCwd))
+			logger.Info("config: default_cwd set", "value", cfg.defaultCwd())
+			writeJSON(w, map[string]any{"ok": true, "default_cwd": cfg.defaultCwd()})
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			writeJSON(w, map[string]any{"error": "method not allowed"})
+		}
 	})
 	root.HandleFunc("/ambient-link/sessions", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -221,9 +301,9 @@ func runServe() error {
 			if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
 				wsScheme = "wss"
 			}
-			p = pair.BuildForHost(r.Host, *token, wsScheme)
+			p = pair.BuildForHost(r.Host, token, wsScheme)
 		} else {
-			p, err = pair.Build(*listen, *token, "ws")
+			p, err = pair.Build(listen, token, "ws")
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -283,33 +363,33 @@ func runServe() error {
 		var req struct {
 			Thread string `json:"thread"`
 			Text   string `json:"text"`
-			Enter  *bool  `json:"enter"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		enter := true
-		if req.Enter != nil {
-			enter = *req.Enter
-		}
 		if req.Thread == "" || req.Text == "" {
 			http.Error(w, "thread and text required", http.StatusBadRequest)
 			return
 		}
-		result, err := inject.SendInputResult(req.Thread, req.Text, enter, "")
+		// Delivery ALWAYS submits. The human turn is recorded by inject in the
+		// store with its honest status; we only echo it onto the live HUD when
+		// it was actually written to the agent — no false "sent" (DECISIONS §4).
+		result, err := inject.SendInputResult(req.Thread, req.Text, "")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		_ = m.IngestUserInput(req.Thread, req.Text)
+		if inject.Delivered(result) {
+			_ = m.IngestUserInput(req.Thread, req.Text)
+		}
 		writeJSON(w, map[string]any{"ok": "input", "delivery": result})
 	})
-	if *webRoot != "" {
-		if st, err := os.Stat(*webRoot); err != nil || !st.IsDir() {
-			return fmt.Errorf("web-root %q: %w", *webRoot, err)
+	if webRoot != "" {
+		if st, err := os.Stat(webRoot); err != nil || !st.IsDir() {
+			return fmt.Errorf("web-root %q: %w", webRoot, err)
 		}
-		root.Handle("/ambient-link/", http.StripPrefix("/ambient-link", webapp.Dir(*webRoot)))
+		root.Handle("/ambient-link/", http.StripPrefix("/ambient-link", webapp.Dir(webRoot)))
 		root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
 				http.Redirect(w, r, "/ambient-link/", http.StatusFound)
@@ -317,11 +397,11 @@ func runServe() error {
 			}
 			http.NotFound(w, r)
 		})
-		logger.Info("host: serving web companion", "root", *webRoot, "base", "/ambient-link/")
+		logger.Info("host: serving web companion", "root", webRoot, "base", "/ambient-link/")
 	}
 
 	srv := &http.Server{
-		Addr:              *listen,
+		Addr:              listen,
 		Handler:           root,
 		ReadHeaderTimeout: 10 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
@@ -330,7 +410,7 @@ func runServe() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := discovery.Advertise(ctx, *listen, *token, logger); err != nil {
+	if err := discovery.Advertise(ctx, listen, token, logger); err != nil {
 		logger.Warn("host: mdns advertise failed", "err", err)
 	} else {
 		logger.Info("host: mdns advertising", "type", discovery.ServiceType)
@@ -339,18 +419,18 @@ func runServe() error {
 	// JSONL tailers — one per agent, both always-on. They share the mux,
 	// so a session that fires both hook events and JSONL writes gets deduped
 	// by the mux on (session_id, event_type) within DedupWindow.
-	if *jsonlRoot != "" {
-		if err := startJSONLTailer(ctx, m, *jsonlRoot, producers.FormatClaude, "claude", logger); err != nil {
+	if jsonlRoot != "" {
+		if err := startJSONLTailer(ctx, m, jsonlRoot, producers.FormatClaude, "claude", logger); err != nil {
 			return err
 		}
 	}
-	if *codexJSONLRoot != "" {
-		if err := startJSONLTailer(ctx, m, *codexJSONLRoot, producers.FormatCodex, "codex", logger); err != nil {
+	if codexJSONLRoot != "" {
+		if err := startJSONLTailer(ctx, m, codexJSONLRoot, producers.FormatCodex, "codex", logger); err != nil {
 			return err
 		}
 	}
-	if *cursorJSONLRoot != "" {
-		if err := startJSONLTailer(ctx, m, *cursorJSONLRoot, producers.FormatCursor, "cursor", logger); err != nil {
+	if cursorJSONLRoot != "" {
+		if err := startJSONLTailer(ctx, m, cursorJSONLRoot, producers.FormatCursor, "cursor", logger); err != nil {
 			return err
 		}
 	}
@@ -403,12 +483,46 @@ func runServe() error {
 		}
 	}()
 
-	// Stale-session reaper
-	go runStaleReaper(ctx, m, 30*time.Minute, 5*time.Minute, logger)
+	// Stale-session reaper — catch-all only. A session is reaped solely when
+	// its process is NOT alive (registry has no live endpoint). A living agent,
+	// idle or waiting for hours, is never killed on a timer (DECISIONS.md §5).
+	isLive := func(sessionID string) bool {
+		_, ok := reg.Get(sessionID)
+		return ok
+	}
+	go runStaleReaper(ctx, m, 30*time.Minute, 5*time.Minute, isLive, logger)
+
+	// Cloud reverse channel (G5). Optional: only when AMBIENT_LINK_CLOUD is set.
+	// Dials out to the cloud relay, mirrors broadcasts up, and accepts
+	// input/special coming down — routed through the same delivery path as a LAN
+	// client. LAN works with no config; the cloud is a backup transport and the
+	// native app stays source of truth (DECISIONS.md §6).
+	if cloudURL := strings.TrimSpace(os.Getenv("AMBIENT_LINK_CLOUD")); cloudURL != "" {
+		br := cloud.New(cloud.Config{
+			URL:    cloudURL,
+			Token:  token,
+			Logger: logger,
+			Deliver: func(thread, text string) (string, error) {
+				res, err := inject.SendInputResult(thread, text, "")
+				if err != nil {
+					return "failed", err
+				}
+				if inject.Delivered(res) {
+					_ = m.IngestUserInput(thread, text)
+				}
+				return res.Status, nil
+			},
+			Special:  inject.SendSpecial,
+			Snapshot: func() []byte { return cloudSnapshot(m, st) },
+		})
+		hub.SetCloud(br)
+		go br.Run(ctx)
+		logger.Info("cloud: reverse channel enabled", "url", cloudURL)
+	}
 
 	go func() {
 		logger.Info("host: listening",
-			"addr", *listen,
+			"addr", listen,
 			"endpoints", []string{
 				"/ambient-link/ws",
 				"/face-chat/ws",
@@ -419,10 +533,11 @@ func runServe() error {
 				"/ambient-link/status",
 				"/healthz",
 			},
-			"auth", boolStr(*token != ""),
+			"auth", boolStr(token != ""),
 		)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("host: listen failed", "err", err)
+		// ln was acquired up front as the single-instance lock.
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("host: serve failed", "err", err)
 			stop()
 		}
 	}()
@@ -445,7 +560,7 @@ func runServe() error {
 // runStaleReaper periodically calls mux.SweepStale to retire sessions that
 // have had no events for at least maxIdle. It's the catch-all behind the
 // PID-based proc watcher.
-func runStaleReaper(ctx context.Context, m *mux.Mux, maxIdle, interval time.Duration, log *slog.Logger) {
+func runStaleReaper(ctx context.Context, m *mux.Mux, maxIdle, interval time.Duration, isLive func(string) bool, log *slog.Logger) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -453,8 +568,8 @@ func runStaleReaper(ctx context.Context, m *mux.Mux, maxIdle, interval time.Dura
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n := m.SweepStale(maxIdle); n > 0 {
-				log.Info("mux: reaped stale sessions", "count", n, "max_idle", maxIdle.String())
+			if n := m.SweepStale(maxIdle, isLive); n > 0 {
+				log.Info("mux: reaped dead sessions (process gone)", "count", n, "max_idle", maxIdle.String())
 			}
 		}
 	}
@@ -487,25 +602,89 @@ func defaultCursorJSONLRoot() string {
 	return home + "/.cursor/projects"
 }
 
+// defaultWebRoot locates the glasses web app to serve. It is per-host correct:
+// an explicit AMBIENT_LINK_WEB_ROOT wins; otherwise the sibling-repo layout
+// (~/ambient-link-meta/web or ../ambient-link-meta/web) is probed. There is no
+// hard-coded absolute path — if nothing is found we return "" and simply don't
+// serve the web companion (DECISIONS: no machine-specific paths).
 func defaultWebRoot() string {
-	// Sibling repo layout: ambient-link-core/host ↔ ambient-link-meta/web
-	if home, err := os.UserHomeDir(); err == nil {
-		candidate := home + "/ambient-link-meta/web"
-		if st, err := os.Stat(candidate); err == nil && st.IsDir() {
-			return candidate
+	if v := strings.TrimSpace(os.Getenv("AMBIENT_LINK_WEB_ROOT")); v != "" {
+		return v
+	}
+	candidates := []string{}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates, filepath.Join(home, "ambient-link-meta", "web"))
+	}
+	candidates = append(candidates, "../ambient-link-meta/web", "../../ambient-link-meta/web")
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && st.IsDir() {
+			abs, _ := filepath.Abs(c)
+			return abs
 		}
 	}
-	// Dev: host/cmd/host → ../../../ambient-link-meta/web won't work from module;
-	// try relative to cwd when launched from ambient-link-meta.
-	if st, err := os.Stat("../ambient-link-meta/web"); err == nil && st.IsDir() {
-		abs, _ := filepath.Abs("../ambient-link-meta/web")
-		return abs
+	return ""
+}
+
+// cloudSnapshot builds the initial state frame the cloud bridge sends upstream
+// on each (re)connect, so a remote client sees current sessions immediately.
+func cloudSnapshot(m *mux.Mux, st *store.Store) []byte {
+	payload, err := json.Marshal(map[string]any{
+		"type":     "relay_hello",
+		"threads":  m.ThreadsHello(),
+		"sessions": m.Snapshot(),
+		"cursor":   map[string]int64{"journal": st.Head()},
+		"at":       time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil
 	}
-	if st, err := os.Stat("../../ambient-link-meta/web"); err == nil && st.IsDir() {
-		abs, _ := filepath.Abs("../../ambient-link-meta/web")
-		return abs
+	return payload
+}
+
+// runAgent implements `host run <agent> [args...]` — launch an agent under a
+// relay-owned PTY for reliable delivery (DECISIONS.md §2b).
+func runAgent(rest []string) error {
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: host run <agent> [args...]   (e.g. host run claude)")
 	}
-	return "/Users/mac/ambient-link-meta/web"
+	agent := rest[0]
+	args := rest[1:]
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	thread := mux.ThreadIDFor(canonicalAgent(agent), cwd)
+	listen := envOr("AMBIENT_LINK_LISTEN", defaultListen)
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil || port == "" {
+		port = "5181"
+	}
+	wsURL := "ws://127.0.0.1:" + port + "/ambient-link/pty"
+	token := os.Getenv("AMBIENT_LINK_TOKEN")
+	logger := newLogger(envOr("AMBIENT_LINK_LOG", "info"))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	logger.Info("run: launching agent under relay PTY", "agent", agent, "thread", thread, "daemon", wsURL)
+	return pty.Run(ctx, agent, args, wsURL, token, thread, logger)
+}
+
+// canonicalAgent maps an executable name to the agent label the JSONL tailers
+// use, so a PTY-launched agent shares a thread with its observed transcript.
+func canonicalAgent(exe string) string {
+	e := strings.ToLower(filepath.Base(exe))
+	e = strings.TrimSuffix(e, ".exe")
+	e = strings.TrimSuffix(e, ".cmd")
+	switch {
+	case strings.Contains(e, "cursor"):
+		return "cursor"
+	case strings.Contains(e, "claude"):
+		return "claude"
+	case strings.Contains(e, "codex"):
+		return "codex"
+	default:
+		return e
+	}
 }
 
 func runPair() error {
@@ -590,4 +769,111 @@ func writeJSON(w http.ResponseWriter, v any) {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "host:", err)
 	os.Exit(1)
+}
+
+// --- single-instance lock -------------------------------------------------
+//
+// The lock is deliberately trivial: binding the TCP port in runServe IS the
+// lock (the OS guarantees one binder). The lock file below only records the
+// running PID so a conflict message can name the process to stop. There is no
+// version arbitration and nothing ever gets killed.
+
+func lockPath() string {
+	return filepath.Join(os.TempDir(), "ambient-link-relay.lock")
+}
+
+func writeLock(listen string) {
+	_ = os.WriteFile(lockPath(), []byte(fmt.Sprintf("%d\n%s\n", os.Getpid(), listen)), 0o644)
+}
+
+func removeLock() { _ = os.Remove(lockPath()) }
+
+// readLockPID returns the PID recorded in the lock file, or 0 if absent. It is
+// advisory only — used to make the "already running" message actionable.
+func readLockPID() int {
+	b, err := os.ReadFile(lockPath())
+	if err != nil {
+		return 0
+	}
+	line := strings.SplitN(string(b), "\n", 2)[0]
+	pid, _ := strconv.Atoi(strings.TrimSpace(line))
+	return pid
+}
+
+// buildRev returns the short VCS revision baked in by `go build`, for
+// read-only "is this the current relay?" observability on /status.
+func buildRev() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				if len(s.Value) > 12 {
+					return s.Value[:12]
+				}
+				return s.Value
+			}
+		}
+	}
+	return "unknown"
+}
+
+func envOr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// stateHome is the relay's on-disk state dir (~/.ambient-link by default),
+// matching where the store keeps relay.db.
+func stateHome() string {
+	if v := strings.TrimSpace(os.Getenv("AMBIENT_LINK_HOME")); v != "" {
+		return v
+	}
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return filepath.Join(h, ".ambient-link")
+	}
+	return "."
+}
+
+// hostConfig is a tiny persisted store for cross-surface settings. Today it
+// holds the default working directory the glasses web app prefills for a new
+// session; the Android app sets it via POST /ambient-link/config.
+type hostConfig struct {
+	mu         sync.Mutex
+	DefaultCwd string `json:"default_cwd"`
+	path       string
+}
+
+func loadHostConfig() *hostConfig {
+	c := &hostConfig{path: filepath.Join(stateHome(), "config.json")}
+	if b, err := os.ReadFile(c.path); err == nil {
+		_ = json.Unmarshal(b, c)
+	}
+	return c
+}
+
+func (c *hostConfig) defaultCwd() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.DefaultCwd
+}
+
+func (c *hostConfig) setDefaultCwd(v string) {
+	c.mu.Lock()
+	c.DefaultCwd = v
+	b, _ := json.Marshal(c)
+	path := c.path
+	c.mu.Unlock()
+	if path != "" {
+		_ = os.MkdirAll(filepath.Dir(path), 0o755)
+		_ = os.WriteFile(path, b, 0o644)
+	}
 }

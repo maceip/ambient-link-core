@@ -17,7 +17,6 @@ import (
 	"github.com/maceip/ambient-link-core/host/internal/backpressure"
 	"github.com/maceip/ambient-link-core/host/internal/dictate"
 	"github.com/maceip/ambient-link-core/host/internal/inject"
-	"github.com/maceip/ambient-link-core/host/internal/journal"
 	"github.com/maceip/ambient-link-core/host/internal/mux"
 	"github.com/maceip/ambient-link-core/host/internal/proto"
 )
@@ -30,6 +29,15 @@ type MuxSource interface {
 	SessionForThread(threadID string) (sessionID, agent string, ok bool)
 }
 
+// Journal is the durable broadcast log the hub uses for subscribe/replay
+// catch-up. The SQLite store satisfies it; the hub never learns it's a
+// database (DECISIONS.md §3).
+type Journal interface {
+	Append(proto.Broadcast) (int64, error)
+	Head() int64
+	ReplayAfter(after int64) ([]proto.Broadcast, error)
+}
+
 // Hub maintains the set of connected WS clients and broadcasts events to
 // them. Implements mux.Sink.
 type Hub struct {
@@ -38,11 +46,18 @@ type Hub struct {
 	mu          sync.RWMutex
 	clients     map[*client]struct{}
 	mux         MuxSource
-	journal     *journal.Journal
+	journal     Journal
 	bearerToken string
 	relayDebug  bool
+	cloud       CloudMirror
 	dictate     *dictate.Sessions
 	dictHandler dictate.Handler
+}
+
+// CloudMirror receives every fanned-out broadcast payload so the optional cloud
+// reverse channel can mirror local state to remote clients (DECISIONS.md §6).
+type CloudMirror interface {
+	Mirror(payload []byte)
 }
 
 // NewHub returns a fresh Hub. logger may be nil (defaults to slog.Default).
@@ -84,7 +99,7 @@ func (h *Hub) commitDictation(threadID, text string) error {
 		}
 		return src.SessionForThread(threadID)
 	}()
-	if err := inject.SendInput(threadID, text, true); err != nil {
+	if err := inject.SendInput(threadID, text); err != nil {
 		h.logger.Warn("dictate: inject failed", "thread", threadID, "err", err)
 	} else if ok && sessionID != "" {
 		h.logger.Info("dictate: delivered", "thread", threadID, "session", sessionID, "text", text)
@@ -98,8 +113,9 @@ func (h *Hub) commitDictation(threadID, text string) error {
 	return src.IngestUserInput(threadID, text)
 }
 
-// SetJournal wires durable broadcast replay for subscribe catch-up.
-func (h *Hub) SetJournal(j *journal.Journal) {
+// SetJournal wires durable broadcast replay for subscribe catch-up. Any
+// implementation of Journal works; in production this is the SQLite store.
+func (h *Hub) SetJournal(j Journal) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.journal = j
@@ -110,6 +126,14 @@ func (h *Hub) SetMux(m MuxSource) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.mux = m
+}
+
+// SetCloud wires the optional cloud reverse channel. Broadcasts that fan out to
+// LAN clients are also mirrored upstream.
+func (h *Hub) SetCloud(c CloudMirror) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cloud = c
 }
 
 // SetRelayDebug suppresses automatic session pushes (thread_idle/busy/…) to
@@ -171,6 +195,12 @@ func (h *Hub) Broadcast(b proto.Broadcast) {
 		return
 	}
 	h.fanout(nil, payload)
+	h.mu.RLock()
+	c := h.cloud
+	h.mu.RUnlock()
+	if c != nil {
+		c.Mirror(payload)
+	}
 }
 
 // ServeHTTP upgrades incoming HTTP connections to WS and registers them as
@@ -278,7 +308,6 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 		Type     string           `json:"type"`
 		Thread   string           `json:"thread"`
 		Text     string           `json:"text"`
-		Enter    *bool            `json:"enter"`
 		Key      string           `json:"key"`
 		ClientID string           `json:"client_id"`
 		Since    map[string]int64 `json:"since"`
@@ -294,11 +323,8 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 	case "hud_yank":
 		h.handleHudYank(from, msg.Thread)
 	case "input":
-		enter := true
-		if msg.Enter != nil {
-			enter = *msg.Enter
-		}
-		result, err := inject.SendInputResult(msg.Thread, msg.Text, enter, msg.ClientID)
+		// Delivery ALWAYS submits; there is no enter flag (DECISIONS.md §4).
+		result, err := inject.SendInputResult(msg.Thread, msg.Text, msg.ClientID)
 		if err != nil {
 			h.logger.Warn("hub: inject failed", "thread", msg.Thread, "err", err)
 			h.sendInputStatus(from, inputStatusMessage{
@@ -321,17 +347,19 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 			Error:        result.Error,
 			At:           time.Now().UnixMilli(),
 		})
-		h.mu.RLock()
-		src := h.mux
-		h.mu.RUnlock()
-		if src != nil {
-			if err := src.IngestUserInput(msg.Thread, msg.Text); err != nil {
-				h.logger.Warn("hub: input ingest failed", "thread", msg.Thread, "err", err)
-			} else {
-				h.logger.Info("hub: input ingested", "thread", msg.Thread, "text", msg.Text)
+		// Only echo the turn onto the LIVE HUD when it was actually written to
+		// the agent. A queued/failed message must not appear as if the agent
+		// received it (no false "sent" — DECISIONS.md §4). The durable store
+		// still records every attempt with its honest status via inject.
+		if inject.Delivered(result) {
+			h.mu.RLock()
+			src := h.mux
+			h.mu.RUnlock()
+			if src != nil {
+				if err := src.IngestUserInput(msg.Thread, msg.Text); err != nil {
+					h.logger.Warn("hub: input ingest failed", "thread", msg.Thread, "err", err)
+				}
 			}
-		} else {
-			h.logger.Info("hub: input received", "thread", msg.Thread, "text", msg.Text)
 		}
 	case "special":
 		if err := inject.SendSpecial(msg.Thread, msg.Key); err != nil {

@@ -33,15 +33,17 @@ type Result struct {
 }
 
 // Deliver routes a user reply into a live terminal session. Tries adapters in
-// order; on failure stores a pending message for background retry.
-func Deliver(sessionID, threadID, agent, text string, enter bool, reg *Registry, box *Outbox) error {
-	_, err := DeliverWithResult(sessionID, threadID, agent, text, enter, reg, box, "")
+// order; on failure stores a pending message for background retry. Delivery
+// ALWAYS submits (types text + Enter) — there is no "don't submit" mode
+// (DECISIONS.md §4). Single-key prompt answers use TrySpecial.
+func Deliver(sessionID, threadID, agent, text string, reg *Registry, box *Outbox) error {
+	_, err := DeliverWithResult(sessionID, threadID, agent, text, reg, box, "")
 	return err
 }
 
 // DeliverWithResult is Deliver plus a structured status for callers that track
 // delivery internally.
-func DeliverWithResult(sessionID, threadID, agent, text string, enter bool, reg *Registry, box *Outbox, messageID string) (Result, error) {
+func DeliverWithResult(sessionID, threadID, agent, text string, reg *Registry, box *Outbox, messageID string) (Result, error) {
 	result := Result{ID: messageID, SessionID: sessionID, ThreadID: threadID}
 	if box == nil {
 		return result, fmt.Errorf("delivery: nil outbox")
@@ -51,7 +53,7 @@ func DeliverWithResult(sessionID, threadID, agent, text string, enter bool, reg 
 		return result, fmt.Errorf("delivery: empty text")
 	}
 	msg := Message{
-		ID: messageID, SessionID: sessionID, ThreadID: threadID, Text: text, Enter: enter,
+		ID: messageID, SessionID: sessionID, ThreadID: threadID, Text: text,
 		At: time.Now().UnixMilli(),
 	}
 	agent = strings.ToLower(strings.TrimSpace(agent))
@@ -75,7 +77,7 @@ func DeliverWithResult(sessionID, threadID, agent, text string, enter bool, reg 
 		return result, nil
 	}
 
-	if err := TryImmediate(sessionID, text, enter, reg); err == nil {
+	if err := TryImmediate(sessionID, text, reg); err == nil {
 		result.Status = StatusDelivered
 		return result, nil
 	} else {
@@ -93,29 +95,34 @@ func DeliverWithResult(sessionID, threadID, agent, text string, enter bool, reg 
 }
 
 // TryImmediate runs terminal adapters when proc correlation has a live endpoint.
-func TryImmediate(sessionID, text string, enter bool, reg *Registry) error {
+// It ALWAYS submits (types text + Enter). The relay-owned PTY path (preferred
+// and most reliable) is resolved earlier, at the inject layer, by thread id.
+func TryImmediate(sessionID, text string, reg *Registry) error {
 	if reg == nil {
 		return fmt.Errorf("delivery: no registry")
 	}
 	ep, ok := reg.Get(sessionID)
-	if !ok || ep.PID <= 0 {
+	if !ok {
+		return fmt.Errorf("delivery: no live endpoint for %s", sessionID)
+	}
+	if ep.PID <= 0 {
 		return fmt.Errorf("delivery: no live endpoint for %s", sessionID)
 	}
 	var attempts []string
-	if err := SendProcessInput(ep.PID, text, enter); err == nil {
+	if err := SendProcessInput(ep.PID, text, true); err == nil {
 		logger.Info("delivery: process input", "session", sessionID, "pid", ep.PID)
 		return nil
 	} else {
 		attempts = append(attempts, err.Error())
 	}
-	if err := SendTmuxPID(ep.PID, text, enter); err == nil {
+	if err := SendTmuxPID(ep.PID, text, true); err == nil {
 		logger.Info("delivery: tmux", "session", sessionID, "pid", ep.PID)
 		return nil
 	} else {
 		attempts = append(attempts, err.Error())
 	}
 	if ep.TTY != "" {
-		if err := WriteTTY(ep.TTY, text, enter); err == nil {
+		if err := WriteTTY(ep.TTY, text, true); err == nil {
 			logger.Info("delivery: tty", "session", sessionID, "tty", ep.TTY)
 			return nil
 		} else {
@@ -123,6 +130,34 @@ func TryImmediate(sessionID, text string, enter bool, reg *Registry) error {
 		}
 	}
 	return fmt.Errorf("delivery: adapters failed for %s (%s)", sessionID, strings.Join(attempts, "; "))
+}
+
+// TrySpecial delivers a single raw key (e.g. y/n for a permission prompt)
+// without a trailing newline. This is a distinct human intent from sending a
+// message, so it has its own path rather than an enter=false flag.
+func TrySpecial(sessionID, key string, reg *Registry) error {
+	if reg == nil {
+		return fmt.Errorf("delivery: no registry")
+	}
+	ep, ok := reg.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("delivery: no live endpoint for %s", sessionID)
+	}
+	if ep.PID <= 0 {
+		return fmt.Errorf("delivery: no live endpoint for %s", sessionID)
+	}
+	if err := SendProcessInput(ep.PID, key, false); err == nil {
+		return nil
+	}
+	if err := SendTmuxPID(ep.PID, key, false); err == nil {
+		return nil
+	}
+	if ep.TTY != "" {
+		if err := WriteTTY(ep.TTY, key, false); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("delivery: special key failed for %s", sessionID)
 }
 
 // RetryPending attempts immediate delivery for one queued message.
@@ -136,7 +171,7 @@ func RetryPending(sessionID string, reg *Registry, box *Outbox) bool {
 		if !ok {
 			return delivered
 		}
-		if err := TryImmediate(sessionID, msg.Text, msg.Enter, reg); err != nil {
+		if err := TryImmediate(sessionID, msg.Text, reg); err != nil {
 			box.MarkAttempt(sessionID, msg.ID, err)
 			return delivered
 		}

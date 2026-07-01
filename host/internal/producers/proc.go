@@ -129,7 +129,16 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 	}
 	agentProcessCounts := make(map[string]int)
 	for _, comm := range pids {
+		if isAgentHelperProcess(comm) {
+			continue
+		}
 		agentProcessCounts[normalizeAgentName(agentFromCommand(comm))]++
+	}
+	if useWindowsProcSupport && w.cfg.Logger != nil {
+		for pid, comm := range pids {
+			w.cfg.Logger.Info("proc: discovered", "pid", pid,
+				"agent", agentFromCommand(comm), "helper", isAgentHelperProcess(comm), "comm", comm)
+		}
 	}
 
 	// Reap: any PID we had before that isn't in the current list — its
@@ -154,7 +163,18 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 		agent := agentFromCommand(comm)
 		sessions := w.sessionsFor(ctx, pid)
 		if len(sessions) == 0 && useWindowsProcSupport {
-			sessions = w.sessionsForUniqueLiveAgent(agent, agentProcessCounts[normalizeAgentName(agent)])
+			// Background helpers (codex app-server / sandbox-setup / node_repl)
+			// are not the interactive TUI we inject into — never register them.
+			if isAgentHelperProcess(comm) {
+				continue
+			}
+			// Primary: match by (agent type + working directory), which
+			// disambiguates agents that share a parent dir (claude/codex both
+			// in C:\Users\mac). Fallback: a single live session of this agent.
+			sessions = w.sessionsForWindowsCWD(pid, agent)
+			if len(sessions) == 0 {
+				sessions = w.sessionsForUniqueLiveAgent(agent, agentProcessCounts[normalizeAgentName(agent)])
+			}
 		}
 		if len(sessions) == 0 {
 			continue
@@ -214,6 +234,11 @@ func (w *ProcWatcher) listAgentPIDs(ctx context.Context) (map[int]string, error)
 
 func looksLikeAgentProcess(cmd string) bool {
 	cmd = strings.ToLower(cmd)
+	// Normalize path separators so Windows command lines (which use backslashes,
+	// e.g. C:\Users\mac\.local\share\cursor-agent\...\node.exe) match the same
+	// markers as posix ones. Without this, node-launched cursor-agent is never
+	// recognized on Windows and its session gets no delivery endpoint.
+	cmd = strings.ReplaceAll(cmd, `\`, "/")
 	// macOS comm is truncated; match full command instead.
 	if strings.Contains(cmd, "/cursor-agent/") || strings.Contains(cmd, " cursor-agent") {
 		return true
@@ -324,6 +349,14 @@ func agentFromCommand(cmd string) string {
 	if strings.Contains(low, "cursor-agent") || strings.Contains(low, "/.local/bin/agent") {
 		return "cursor"
 	}
+	// Node-launched agents present as `node.exe <path>/codex.js ...` etc, so the
+	// first token (node) is not the agent — scan the whole command line.
+	if strings.Contains(low, "codex") {
+		return "codex"
+	}
+	if strings.Contains(low, "claude") {
+		return "claude"
+	}
 	base := normalizeAgentName(agentBase(cmd))
 	switch base {
 	case "claude", "codex", "cursor-agent", "agent":
@@ -334,6 +367,44 @@ func agentFromCommand(cmd string) string {
 	default:
 		return base
 	}
+}
+
+// isAgentHelperProcess reports whether a command line belongs to a background
+// helper spawned by an agent (codex app-server / sandbox-setup / node_repl,
+// MCP/language servers) rather than the interactive terminal TUI. Such
+// processes must never be registered as a delivery endpoint.
+func isAgentHelperProcess(cmd string) bool {
+	low := strings.ToLower(cmd)
+	for _, marker := range []string{
+		"app-server",
+		"sandbox-setup",
+		"node_repl",
+		"--listen",
+		"mcp-server",
+		"language-server",
+	} {
+		if strings.Contains(low, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeCWD canonicalizes a path for cross-form comparison: lowercased,
+// forward slashes, drive letter stripped, no trailing slash. This lets a
+// process cwd ("C:\Users\mac\ambient-link-meta") match a session cwd stored in
+// posix form ("/Users/mac/ambient-link-meta").
+func normalizeCWD(p string) string {
+	p = strings.TrimSpace(strings.ToLower(p))
+	if p == "" {
+		return ""
+	}
+	p = strings.ReplaceAll(p, `\`, "/")
+	if len(p) >= 2 && p[1] == ':' {
+		p = p[2:]
+	}
+	p = strings.TrimRight(p, "/")
+	return p
 }
 
 func normalizeAgentName(agent string) string {

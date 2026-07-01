@@ -12,7 +12,7 @@ func setOutboxHome(t *testing.T) {
 func TestOutboxEnqueueDequeue(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	msg := Message{SessionID: "sess-1", ThreadID: "claude-abc", Text: "continue", Enter: true, At: 1}
+	msg := Message{SessionID: "sess-1", ThreadID: "claude-abc", Text: "continue", At: 1}
 	if err := box.Enqueue(msg); err != nil {
 		t.Fatal(err)
 	}
@@ -31,8 +31,8 @@ func TestOutboxEnqueueDequeue(t *testing.T) {
 func TestOutboxPreservesFIFO(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	_ = box.Enqueue(Message{ID: "a", SessionID: "sess-1", ThreadID: "claude-abc", Text: "first", Enter: true})
-	_ = box.Enqueue(Message{ID: "b", SessionID: "sess-1", ThreadID: "claude-abc", Text: "second", Enter: true})
+	_ = box.Enqueue(Message{ID: "a", SessionID: "sess-1", ThreadID: "claude-abc", Text: "first"})
+	_ = box.Enqueue(Message{ID: "b", SessionID: "sess-1", ThreadID: "claude-abc", Text: "second"})
 	if got := box.Count("sess-1"); got != 2 {
 		t.Fatalf("count=%d, want 2", got)
 	}
@@ -49,7 +49,7 @@ func TestOutboxPreservesFIFO(t *testing.T) {
 func TestHookResponseStop(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	_ = box.Enqueue(Message{SessionID: "s1", Text: "please verify", Enter: true})
+	_ = box.Enqueue(Message{SessionID: "s1", Text: "please verify"})
 	resp := HookResponse("Stop", "s1", nil, box)
 	if resp == nil || resp["decision"] != "block" {
 		t.Fatalf("stop resp: %#v", resp)
@@ -62,7 +62,7 @@ func TestHookResponseStop(t *testing.T) {
 func TestHookResponsePermissionDoesNotDropNonPermissionReply(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	_ = box.Enqueue(Message{SessionID: "s1", Text: "please continue", Enter: true})
+	_ = box.Enqueue(Message{SessionID: "s1", Text: "please continue"})
 	resp := HookResponse("PermissionRequest", "s1", nil, box)
 	if resp != nil {
 		t.Fatalf("non-permission text should not satisfy permission request: %#v", resp)
@@ -75,7 +75,7 @@ func TestHookResponsePermissionDoesNotDropNonPermissionReply(t *testing.T) {
 func TestHookResponsePermission(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	_ = box.Enqueue(Message{SessionID: "s1", Text: "y", Enter: false})
+	_ = box.Enqueue(Message{SessionID: "s1", Text: "y"})
 	resp := HookResponse("PermissionRequest", "s1", nil, box)
 	hs, ok := resp["hookSpecificOutput"].(map[string]any)
 	if !ok {
@@ -90,7 +90,7 @@ func TestHookResponsePermission(t *testing.T) {
 func TestDeliverWithResultQueuesWithoutLiveEndpoint(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	res, err := DeliverWithResult("s1", "codex-abc", "codex", "hello", true, NewRegistry(), box, "client-1")
+	res, err := DeliverWithResult("s1", "codex-abc", "codex", "hello", NewRegistry(), box, "client-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,8 +106,8 @@ func TestDeliverWithResultQueuesWithoutLiveEndpoint(t *testing.T) {
 func TestDeliverWithResultPreservesPendingOrder(t *testing.T) {
 	setOutboxHome(t)
 	box := NewOutbox()
-	_ = box.Enqueue(Message{ID: "first", SessionID: "s1", ThreadID: "codex-abc", Text: "first", Enter: true})
-	res, err := DeliverWithResult("s1", "codex-abc", "codex", "second", true, NewRegistry(), box, "second")
+	_ = box.Enqueue(Message{ID: "first", SessionID: "s1", ThreadID: "codex-abc", Text: "first"})
+	res, err := DeliverWithResult("s1", "codex-abc", "codex", "second", NewRegistry(), box, "second")
 	if err != nil {
 		t.Fatal(err)
 	}

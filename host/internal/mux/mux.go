@@ -196,12 +196,22 @@ func (m *Mux) Ingest(ev proto.Event) error {
 	return nil
 }
 
-// SweepStale scans for sessions in IDLE / AWAITING_PERMISSION states that
-// have not seen any event for at least maxIdle, and marks them DEAD. This
-// is the defense-in-depth backup to the process watcher: even if PID-based
-// death detection misses a vanished agent, sessions still get cleaned up
-// after maxIdle of silence. Returns count marked.
-func (m *Mux) SweepStale(maxIdle time.Duration) int {
+// SweepStale retires sessions that have gone silent AND whose process is no
+// longer alive. Death is process-driven (the proc watcher MarkDead's vanished
+// PIDs); this is only the catch-all for sessions the watcher can't see — e.g.
+// a session reconstructed purely from a JSONL transcript whose process has
+// already exited. It must NEVER kill a living agent: an agent idle or waiting on
+// a permission prompt for hours is alive and is exactly what we most need to
+// keep on the HUD (DECISIONS.md §5 — this fixes the bug that marked waiting
+// agents DEAD on a 30-minute timer).
+//
+// isLive reports whether a session's process is currently observed alive (in
+// production: the delivery registry has a live endpoint for it). When isLive is
+// nil, nothing is swept — death then comes solely from the proc watcher.
+func (m *Mux) SweepStale(maxIdle time.Duration, isLive func(sessionID string) bool) int {
+	if isLive == nil {
+		return 0
+	}
 	cutoff := time.Now().Add(-maxIdle).UnixMilli()
 	var victims []string
 	m.mu.Lock()
@@ -214,10 +224,15 @@ func (m *Mux) SweepStale(maxIdle time.Duration) int {
 		}
 	}
 	m.mu.Unlock()
+	reaped := 0
 	for _, id := range victims {
+		if isLive(id) {
+			continue // alive — never kill on a timer
+		}
 		m.MarkDead(id)
+		reaped++
 	}
-	return len(victims)
+	return reaped
 }
 
 // MarkDead is an external signal (typically from the process watcher) that
