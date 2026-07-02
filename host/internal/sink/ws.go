@@ -50,6 +50,7 @@ type Hub struct {
 	bearerToken string
 	relayDebug  bool
 	cloud       CloudMirror
+	cloudPeer   CloudPeer
 	dictate     *dictate.Sessions
 	dictHandler dictate.Handler
 }
@@ -58,6 +59,13 @@ type Hub struct {
 // reverse channel can mirror local state to remote clients (DECISIONS.md §6).
 type CloudMirror interface {
 	Mirror(payload []byte)
+}
+
+// CloudPeer forwards web-client input to a connected laptop bridge (cloud relay).
+type CloudPeer interface {
+	Connected() bool
+	SendInput(thread, text, clientID string) error
+	SendSpecial(thread, key string) error
 }
 
 // NewHub returns a fresh Hub. logger may be nil (defaults to slog.Default).
@@ -134,6 +142,51 @@ func (h *Hub) SetCloud(c CloudMirror) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.cloud = c
+}
+
+// SetCloudPeer wires the cloud-side laptop bridge acceptor (DECISIONS.md §6).
+func (h *Hub) SetCloudPeer(p CloudPeer) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cloudPeer = p
+}
+
+// ApplyUpstreamBroadcast ingests a broadcast frame mirrored from a laptop peer.
+func (h *Hub) ApplyUpstreamBroadcast(data []byte) {
+	var b proto.Broadcast
+	if err := json.Unmarshal(data, &b); err != nil || b.Type == "" {
+		return
+	}
+	h.mu.RLock()
+	src := h.mux
+	h.mu.RUnlock()
+	if src != nil {
+		if sync, ok := src.(interface{ ApplyUpstream(proto.Broadcast) }); ok {
+			sync.ApplyUpstream(b)
+		}
+	}
+	h.Broadcast(b)
+}
+
+// ApplyRelayHello seeds cloud mux state from the laptop snapshot sent on connect.
+func (h *Hub) ApplyRelayHello(data []byte) {
+	var msg struct {
+		Type     string            `json:"type"`
+		Sessions []mux.SessionView `json:"sessions"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil || msg.Type != "relay_hello" {
+		return
+	}
+	h.mu.RLock()
+	src := h.mux
+	h.mu.RUnlock()
+	if src == nil {
+		return
+	}
+	if sync, ok := src.(interface{ SyncSessions([]mux.SessionView) }); ok {
+		sync.SyncSessions(msg.Sessions)
+	}
+	h.logger.Info("hub: relay_hello synced sessions", "count", len(msg.Sessions))
 }
 
 // SetRelayDebug suppresses automatic session pushes (thread_idle/busy/…) to
@@ -323,6 +376,9 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 	case "hud_yank":
 		h.handleHudYank(from, msg.Thread)
 	case "input":
+		if h.tryCloudForward(from, msg.Thread, msg.Text, msg.ClientID) {
+			return
+		}
 		// Delivery ALWAYS submits; there is no enter flag (DECISIONS.md §4).
 		result, err := inject.SendInputResult(msg.Thread, msg.Text, msg.ClientID)
 		if err != nil {
@@ -362,6 +418,9 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 			}
 		}
 	case "special":
+		if h.tryCloudSpecial(msg.Thread, msg.Key) {
+			return
+		}
 		if err := inject.SendSpecial(msg.Thread, msg.Key); err != nil {
 			h.logger.Warn("hub: special inject failed", "thread", msg.Thread, "key", msg.Key, "err", err)
 		}
@@ -371,6 +430,41 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 	default:
 		h.logger.Debug("hub: ignored client message", "type", msg.Type)
 	}
+}
+
+func (h *Hub) tryCloudForward(from *client, thread, text, clientID string) bool {
+	h.mu.RLock()
+	peer := h.cloudPeer
+	h.mu.RUnlock()
+	if peer == nil || !peer.Connected() || thread == "" || text == "" {
+		return false
+	}
+	if err := peer.SendInput(thread, text, clientID); err != nil {
+		h.logger.Warn("hub: cloud peer forward failed", "thread", thread, "err", err)
+		return false
+	}
+	h.sendInputStatus(from, inputStatusMessage{
+		Type:   "input_status",
+		ID:     clientID,
+		Thread: thread,
+		Status: "sent",
+		At:     time.Now().UnixMilli(),
+	})
+	return true
+}
+
+func (h *Hub) tryCloudSpecial(thread, key string) bool {
+	h.mu.RLock()
+	peer := h.cloudPeer
+	h.mu.RUnlock()
+	if peer == nil || !peer.Connected() || thread == "" || key == "" {
+		return false
+	}
+	if err := peer.SendSpecial(thread, key); err != nil {
+		h.logger.Warn("hub: cloud peer special failed", "thread", thread, "err", err)
+		return false
+	}
+	return true
 }
 
 func (h *Hub) sendInputStatus(to *client, msg inputStatusMessage) {

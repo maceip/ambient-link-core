@@ -224,6 +224,9 @@ func runServe() error {
 	root := http.NewServeMux()
 	root.Handle("/ambient-link/ws", hub)
 	root.Handle("/face-chat/ws", hub)
+	cloudPeer := cloud.NewPeerServer(hub, logger)
+	hub.SetCloudPeer(cloudPeer)
+	root.Handle("/ambient-link/relay", cloudPeer)
 	root.Handle("/ambient-link/hooks/", hooksHandler)
 	root.Handle("/ambient-link/ingest", ingestHandler)
 	// Control channel for `host run <agent>` (relay-owned PTY mode).
@@ -239,6 +242,7 @@ func runServe() error {
 			"delivery":    reg.Snapshot(),
 			"outbox":      outbox,
 			"relay_debug": relayDebug,
+			"cloud_peer":  cloudPeer.Connected(),
 			"journal":     st.Head(),
 			"db":          st.Path(),
 			"default_cwd": cfg.defaultCwd(),
@@ -525,6 +529,7 @@ func runServe() error {
 			"addr", listen,
 			"endpoints", []string{
 				"/ambient-link/ws",
+				"/ambient-link/relay",
 				"/face-chat/ws",
 				"/ambient-link/ingest",
 				"/ambient-link/pair",

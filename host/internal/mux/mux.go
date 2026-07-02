@@ -279,6 +279,130 @@ func (m *Mux) Snapshot() []SessionView {
 	return out
 }
 
+// ApplyUpstream merges a laptop-mirrored broadcast into local mux state without
+// re-emitting downstream (cloud relay uses this so /status matches the laptop).
+func (m *Mux) ApplyUpstream(b proto.Broadcast) {
+	if b.Type == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessionForUpstreamLocked(b)
+	if s == nil {
+		return
+	}
+	at := b.At
+	if at == 0 {
+		at = time.Now().UnixMilli()
+	}
+	if b.Label != "" {
+		s.label = b.Label
+	}
+	if b.Agent != "" {
+		s.agent = b.Agent
+	}
+	if b.CWD != "" {
+		s.cwd = b.CWD
+	}
+	if b.LastAssistant != "" {
+		s.lastAssistant = clip(b.LastAssistant, m.opt.MaxAssistantSnippet)
+	}
+	if b.LastUserInput != "" {
+		s.lastUserInput = clip(b.LastUserInput, m.opt.MaxAssistantSnippet)
+	}
+	if b.PermissionPrompt != "" {
+		s.lastPermissionPrompt = clip(b.PermissionPrompt, m.opt.MaxPermissionSnippet)
+	}
+	switch b.Type {
+	case proto.BroadcastThreadStarted:
+		if s.state == proto.StateDead || s.state == proto.StateStarting {
+			s.state = proto.StateStarting
+		}
+	case proto.BroadcastThreadBusy:
+		s.state = proto.StateBusy
+	case proto.BroadcastThreadIdle, proto.BroadcastHudYank:
+		if b.Awaiting == "permission" {
+			s.state = proto.StateAwaitingPermission
+		} else {
+			s.state = proto.StateIdle
+		}
+	case proto.BroadcastThreadEnded:
+		s.state = proto.StateDead
+	}
+	s.lastEventAt = at
+}
+
+// SyncSessions replaces cloud mux rows from a laptop relay_hello snapshot.
+func (m *Mux) SyncSessions(views []SessionView) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, v := range views {
+		if v.SessionID == "" || v.State == proto.StateDead {
+			continue
+		}
+		ev := &proto.Event{
+			SessionID:  v.SessionID,
+			Agent:      v.Agent,
+			CWD:        v.CWD,
+			Type:       proto.EventSessionStart,
+			Source:     proto.ProducerHooks,
+			ObservedAt: v.LastEventAt,
+		}
+		s, _ := m.getOrCreateLocked(ev)
+		if v.Label != "" {
+			s.label = v.Label
+		}
+		if v.Agent != "" {
+			s.agent = v.Agent
+		}
+		if v.CWD != "" {
+			s.cwd = v.CWD
+		}
+		s.state = v.State
+		if v.LastAssistant != "" {
+			s.lastAssistant = clip(v.LastAssistant, m.opt.MaxAssistantSnippet)
+		}
+		if v.LastUserInput != "" {
+			s.lastUserInput = clip(v.LastUserInput, m.opt.MaxAssistantSnippet)
+		}
+		if v.PermissionPrompt != "" {
+			s.lastPermissionPrompt = clip(v.PermissionPrompt, m.opt.MaxPermissionSnippet)
+		}
+		if v.LastEventAt != 0 {
+			s.lastEventAt = v.LastEventAt
+		}
+	}
+}
+
+func (m *Mux) sessionForUpstreamLocked(b proto.Broadcast) *session {
+	if b.SessionID != "" {
+		if s, ok := m.sessions[b.SessionID]; ok {
+			return s
+		}
+	}
+	if b.Thread != "" {
+		if s := m.bestSessionLocked(b.Thread); s != nil {
+			return s
+		}
+	}
+	if b.SessionID == "" {
+		return nil
+	}
+	ev := &proto.Event{
+		SessionID:  b.SessionID,
+		Agent:      b.Agent,
+		CWD:        b.CWD,
+		Type:       proto.EventSessionStart,
+		Source:     proto.ProducerHooks,
+		ObservedAt: b.At,
+	}
+	s, _ := m.getOrCreateLocked(ev)
+	if b.Label != "" {
+		s.label = b.Label
+	}
+	return s
+}
+
 // ThreadMeta is the per-thread row in the WS hello payload.
 type ThreadMeta struct {
 	ID    string `json:"id"`
