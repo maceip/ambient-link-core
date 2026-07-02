@@ -8,7 +8,7 @@ codebases; bump `PROTOCOL_VERSION` below when you break wire compat.
 PROTOCOL_VERSION = 1
 ```
 
-_Additive in v1: `hud_yank` (web → server → phone daemons), `dictate_*` (phone/web STT sessions)._
+_Additive in v1: `hud_yank` (web → server → phone daemons), `dictate_*` (phone/web STT sessions), `session_focus` / `session_blur` (mic pre-warm)._
 
 ## Transport
 
@@ -172,6 +172,15 @@ Phone or web companion starts dictation for a thread. Partials are UI-only;
 { "type": "dictate_partial", "thread": "claude", "text": "please fix", "source": "phone" }
 { "type": "dictate_commit", "thread": "claude", "text": "please fix the tests", "source": "phone" }
 { "type": "dictate_abort", "thread": "claude", "source": "web" }
+```
+
+### `session_focus`, `session_blur`
+
+Sent when the user opens or leaves a session in the glasses web app (or mirrored from HUD activity). Phone daemons may start the mic before `dictate_begin` to cut latency.
+
+```json
+{ "type": "session_focus", "thread": "claude", "source": "web" }
+{ "type": "session_blur", "thread": "claude", "source": "web" }
 ```
 
 ## State machine

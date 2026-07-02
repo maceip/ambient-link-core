@@ -427,6 +427,9 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 	case dictate.MsgBegin, dictate.MsgPartial, dictate.MsgCommit, dictate.MsgAbort:
 		h.ensureDictate()
 		h.dictHandler.Handle(h.dictate, data)
+	case "session_focus", "session_blur":
+		// Web/HUD activity — fan to phone daemons so mic can warm before dictate_begin.
+		h.fanout(from, data)
 	default:
 		h.logger.Debug("hub: ignored client message", "type", msg.Type)
 	}
