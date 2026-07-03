@@ -214,6 +214,19 @@ func runServe() error {
 	delivery.SetLogger(logger)
 	inject.Init(m, reg, box, st)
 
+	if n, err := box.PurgeOlderThan(7 * 24 * time.Hour); err != nil {
+		logger.Warn("outbox: purge stale failed", "err", err)
+	} else if n > 0 {
+		logger.Info("outbox: purged stale messages", "count", n)
+	}
+
+	m.SetUserPromptLandHook(func(sessionID, threadID, text string) {
+		if err := st.MarkLanded(sessionID, text); err != nil {
+			logger.Warn("store: mark landed", "session", sessionID, "err", err)
+		}
+		hub.FanoutInputStatus(sink.InputStatusLanded(threadID, sessionID))
+	})
+
 	hooksHandler := producers.NewHooks(m, producers.HooksConfig{
 		BearerToken: token,
 		Logger:      logger,
@@ -227,6 +240,7 @@ func runServe() error {
 	cloudPeer := cloud.NewPeerServer(hub, logger)
 	hub.SetCloudPeer(cloudPeer)
 	root.Handle("/ambient-link/relay", cloudPeer)
+	var macCloudBridge *cloud.Bridge
 	root.Handle("/ambient-link/hooks/", hooksHandler)
 	root.Handle("/ambient-link/ingest", ingestHandler)
 	// Control channel for `host run <agent>` (relay-owned PTY mode).
@@ -237,12 +251,19 @@ func runServe() error {
 	root.HandleFunc("/ambient-link/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		outbox, _ := box.Snapshot()
+		bridgeUp := macCloudBridge != nil && macCloudBridge.Connected()
+		laptopPeer := cloudPeer.Connected()
 		writeJSON(w, map[string]any{
 			"sessions":    m.Snapshot(),
 			"delivery":    reg.Snapshot(),
 			"outbox":      outbox,
 			"relay_debug": relayDebug,
-			"cloud_peer":  cloudPeer.Connected(),
+			// Mac → cloud uplink (true on your laptop when AMBIENT_LINK_CLOUD is set).
+			"cloud_bridge_connected": bridgeUp,
+			// Laptop → this server (true on public.computer when your Mac is linked).
+			"laptop_peer_connected": laptopPeer,
+			// Deprecated: same as laptop_peer_connected. Misleading on Mac localhost.
+			"cloud_peer": laptopPeer,
 			"journal":     st.Head(),
 			"db":          st.Path(),
 			"default_cwd": cfg.defaultCwd(),
@@ -263,14 +284,64 @@ func runServe() error {
 		case http.MethodPost:
 			var body struct {
 				DefaultCwd string `json:"default_cwd"`
+				Create     bool   `json:"create"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			cfg.setDefaultCwd(strings.TrimSpace(body.DefaultCwd))
-			logger.Info("config: default_cwd set", "value", cfg.defaultCwd())
-			writeJSON(w, map[string]any{"ok": true, "default_cwd": cfg.defaultCwd()})
+			trimmed := strings.TrimSpace(body.DefaultCwd)
+			if trimmed == "" {
+				cfg.setDefaultCwd("")
+				writeJSON(w, map[string]any{"ok": true, "exists": true, "default_cwd": ""})
+				return
+			}
+			resolved, err := resolveMacCwd(trimmed)
+			if err != nil {
+				writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			st, statErr := os.Stat(resolved)
+			if statErr != nil {
+				if !os.IsNotExist(statErr) {
+					writeJSON(w, map[string]any{"ok": false, "error": statErr.Error()})
+					return
+				}
+				if !body.Create {
+					writeJSON(w, map[string]any{
+						"ok":            false,
+						"exists":        false,
+						"default_cwd":   trimmed,
+						"resolved_path": resolved,
+					})
+					return
+				}
+				if mkErr := os.MkdirAll(resolved, 0o755); mkErr != nil {
+					writeJSON(w, map[string]any{
+						"ok":            false,
+						"exists":        false,
+						"resolved_path": resolved,
+						"error":         mkErr.Error(),
+					})
+					return
+				}
+			} else if !st.IsDir() {
+				writeJSON(w, map[string]any{
+					"ok":            false,
+					"exists":        false,
+					"resolved_path": resolved,
+					"error":         "not a directory",
+				})
+				return
+			}
+			cfg.setDefaultCwd(trimmed)
+			logger.Info("config: default_cwd set", "value", cfg.defaultCwd(), "resolved", resolved)
+			writeJSON(w, map[string]any{
+				"ok":            true,
+				"exists":        true,
+				"default_cwd":   cfg.defaultCwd(),
+				"resolved_path": resolved,
+			})
 		default:
 			w.Header().Set("Allow", "GET, POST")
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -502,7 +573,7 @@ func runServe() error {
 	// client. LAN works with no config; the cloud is a backup transport and the
 	// native app stays source of truth (DECISIONS.md §6).
 	if cloudURL := strings.TrimSpace(os.Getenv("AMBIENT_LINK_CLOUD")); cloudURL != "" {
-		br := cloud.New(cloud.Config{
+		macCloudBridge = cloud.New(cloud.Config{
 			URL:    cloudURL,
 			Token:  token,
 			Logger: logger,
@@ -519,8 +590,8 @@ func runServe() error {
 			Special:  inject.SendSpecial,
 			Snapshot: func() []byte { return cloudSnapshot(m, st) },
 		})
-		hub.SetCloud(br)
-		go br.Run(ctx)
+		hub.SetCloud(macCloudBridge)
+		go macCloudBridge.Run(ctx)
 		logger.Info("cloud: reverse channel enabled", "url", cloudURL)
 	}
 
@@ -881,4 +952,33 @@ func (c *hostConfig) setDefaultCwd(v string) {
 		_ = os.MkdirAll(filepath.Dir(path), 0o755)
 		_ = os.WriteFile(path, b, 0o644)
 	}
+}
+
+// resolveMacCwd expands ~ and relative paths against the relay host user's home.
+func resolveMacCwd(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	raw = strings.ReplaceAll(raw, "～", "~")
+	if strings.HasPrefix(raw, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot expand ~: %w", err)
+		}
+		rest := strings.TrimPrefix(raw, "~")
+		rest = strings.TrimPrefix(rest, "/")
+		if rest == "" {
+			return home, nil
+		}
+		return filepath.Join(home, rest), nil
+	}
+	if filepath.IsAbs(raw) {
+		return filepath.Clean(raw), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Clean(raw), nil
+	}
+	return filepath.Join(home, raw), nil
 }

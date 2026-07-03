@@ -50,6 +50,10 @@ type SinkFunc func(proto.Broadcast)
 
 func (f SinkFunc) Broadcast(b proto.Broadcast) { f(b) }
 
+// UserPromptLandHook is invoked when a JSONL transcript confirms a user turn
+// landed in the agent (distinct from mux.IngestUserInput from the HUD path).
+type UserPromptLandHook func(sessionID, threadID, text string)
+
 // Options control mux behavior. The zero value of Options is a working
 // default for production via [WithDefaults].
 type Options struct {
@@ -113,6 +117,8 @@ type Mux struct {
 	threads  map[string]threadSet // threadID  → set of sessionIDs
 	recent   map[string]int64     // dedup key → unix-ms last seen
 
+	onUserPromptLand UserPromptLandHook
+
 	stop   chan struct{}
 	stopWg sync.WaitGroup
 }
@@ -135,6 +141,13 @@ func New(sink Sink, opt Options) *Mux {
 	m.stopWg.Add(1)
 	go m.gcLoop()
 	return m
+}
+
+// SetUserPromptLandHook wires transcript-confirmed user turns (JSONL only).
+func (m *Mux) SetUserPromptLandHook(h UserPromptLandHook) {
+	m.mu.Lock()
+	m.onUserPromptLand = h
+	m.mu.Unlock()
 }
 
 // Close stops the background goroutine and clears outstanding idle timers.
@@ -192,6 +205,13 @@ func (m *Mux) Ingest(ev proto.Event) error {
 	// period flips it to inferred-IDLE; subsequent events reset the timer.
 	if after == proto.StateBusy {
 		m.armIdleLocked(s)
+	}
+
+	if ev.Type == proto.EventUserPrompt && ev.Source == proto.ProducerJSONL {
+		if txt := stripRedactedSnippets(extractText(ev.Payload)); txt != "" && m.onUserPromptLand != nil {
+			sid, tid, hook := s.id, s.threadID, m.onUserPromptLand
+			go hook(sid, tid, txt)
+		}
 	}
 	return nil
 }

@@ -321,3 +321,41 @@ func (o *Outbox) Snapshot() ([]PendingSession, error) {
 	}
 	return out, nil
 }
+
+// PurgeOlderThan drops queued messages whose At timestamp is before cutoff.
+// Returns the number of messages removed.
+func (o *Outbox) PurgeOlderThan(maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-maxAge).UnixMilli()
+	ids, err := o.ListPendingIDs()
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, id := range ids {
+		path, err := pendingPath(id)
+		if err != nil {
+			continue
+		}
+		o.mu.Lock()
+		rows, err := readQueue(path)
+		if err != nil {
+			o.mu.Unlock()
+			_ = os.Remove(path)
+			continue
+		}
+		kept := rows[:0]
+		for _, msg := range rows {
+			if msg.At > 0 && msg.At < cutoff {
+				removed++
+				continue
+			}
+			kept = append(kept, msg)
+		}
+		_ = writeQueue(path, kept)
+		o.mu.Unlock()
+	}
+	return removed, nil
+}

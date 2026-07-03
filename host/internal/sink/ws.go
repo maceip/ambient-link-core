@@ -427,8 +427,8 @@ func (h *Hub) handleInbound(from *client, data []byte) {
 	case dictate.MsgBegin, dictate.MsgPartial, dictate.MsgCommit, dictate.MsgAbort:
 		h.ensureDictate()
 		h.dictHandler.Handle(h.dictate, data)
-	case "session_focus", "session_blur":
-		// Web/HUD activity — fan to phone daemons so mic can warm before dictate_begin.
+	case "session_focus", "session_blur", "companion_ui", "companion_config":
+		// Web/HUD activity — fan to phone daemons (mic warm, suppress DAT overlay).
 		h.fanout(from, data)
 	default:
 		h.logger.Debug("hub: ignored client message", "type", msg.Type)
@@ -480,6 +480,19 @@ func (h *Hub) sendInputStatus(to *client, msg inputStatusMessage) {
 		return
 	}
 	to.enqueue(payload)
+}
+
+// FanoutInputStatus broadcasts delivery/landing status to every WS client.
+func (h *Hub) FanoutInputStatus(msg inputStatusMessage) {
+	if msg.Type == "" {
+		msg.Type = "input_status"
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		h.logger.Warn("hub: input status marshal", "err", err)
+		return
+	}
+	h.fanout(nil, payload)
 }
 
 func (h *Hub) replayJournal(to *client, since map[string]int64) {
@@ -560,6 +573,18 @@ type inputStatusMessage struct {
 	PendingCount int    `json:"pending_count,omitempty"`
 	Error        string `json:"error,omitempty"`
 	At           int64  `json:"at"`
+}
+
+// InputStatusLanded builds a fan-out frame when the agent transcript confirms
+// a HUD reply became a user turn.
+func InputStatusLanded(threadID, sessionID string) inputStatusMessage {
+	return inputStatusMessage{
+		Type:      "input_status",
+		Thread:    threadID,
+		SessionID: sessionID,
+		Status:    "landed",
+		At:        time.Now().UnixMilli(),
+	}
 }
 
 // ── per-client state ────────────────────────────────────────────────────
