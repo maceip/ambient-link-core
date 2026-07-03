@@ -86,7 +86,7 @@ func WithDefaults(opt Options) Options {
 		opt.DedupWindow = 2500 * time.Millisecond
 	}
 	if opt.IdleDebounce == 0 {
-		opt.IdleDebounce = 4 * time.Second
+		opt.IdleDebounce = 2 * time.Second
 	}
 	if opt.MaxAssistantSnippet == 0 {
 		opt.MaxAssistantSnippet = 4096
