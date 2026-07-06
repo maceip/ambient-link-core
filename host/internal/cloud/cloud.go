@@ -24,6 +24,7 @@ package cloud
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -127,6 +128,9 @@ func (b *Bridge) session(ctx context.Context) error {
 		return err
 	}
 	b.log.Info("cloud: connected", "url", b.cfg.URL)
+	// Downstream frames are small (input/special), but keep the peer channel
+	// symmetric with the server's limit so neither side can silently kill it.
+	conn.SetReadLimit(8 << 20)
 	b.mu.Lock()
 	b.conn = conn
 	b.mu.Unlock()
@@ -143,8 +147,13 @@ func (b *Bridge) session(ctx context.Context) error {
 	if b.cfg.Snapshot != nil {
 		if snap := b.cfg.Snapshot(); len(snap) > 0 {
 			wctx, wc := context.WithTimeout(sessCtx, 5*time.Second)
-			_ = conn.Write(wctx, websocket.MessageText, snap)
+			err := conn.Write(wctx, websocket.MessageText, snap)
 			wc()
+			if err != nil {
+				// The hello is the session sync — if it can't be sent the
+				// bridge is useless; fail loudly instead of half-connecting.
+				return fmt.Errorf("relay_hello write (%d bytes): %w", len(snap), err)
+			}
 		}
 	}
 

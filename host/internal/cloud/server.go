@@ -103,6 +103,11 @@ func (p *PeerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.log.Warn("cloud peer: upgrade failed", "err", err)
 		return
 	}
+	// relay_hello carries every live session with up-to-4KB snippets; the
+	// websocket default read limit (32KB) killed any bridge whose snapshot
+	// exceeded it — the B-105 "connects then dies in 300ms" flake. Size the
+	// limit to the mux bound (256 sessions × ~9KB snippets ≈ 2.3MB).
+	conn.SetReadLimit(8 << 20)
 	p.mu.Lock()
 	if old := p.conn; old != nil {
 		_ = old.Close(websocket.StatusNormalClosure, "replaced")
@@ -130,6 +135,11 @@ func (p *PeerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
+			// Name the close reason: a silent return here hid the read-limit
+			// kill for days (every log just said connected/disconnected).
+			if ctx.Err() == nil {
+				p.log.Warn("cloud peer: read ended", "err", err)
+			}
 			return
 		}
 		var peek struct {
