@@ -30,7 +30,11 @@ func SendTmuxPID(pid int, text string, enter bool) error {
 }
 
 func tmuxTargetForPID(pid int) (string, error) {
-	out, err := exec.Command("tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}:#{pane_index}").Output()
+	// Separator must be a plain printable char: when tmux runs without a
+	// locale (launchd daemons have no LANG), it sanitizes control characters
+	// in format output, turning a \t separator into "_" and breaking the
+	// parse. Target by pane id (%N) — unambiguous and free of name parsing.
+	out, err := exec.Command("tmux", "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}").Output()
 	if err != nil {
 		return "", fmt.Errorf("delivery: tmux not available: %w", err)
 	}
@@ -41,12 +45,12 @@ func tmuxTargetForPID(pid int) (string, error) {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
+		parts := strings.SplitN(line, " ", 2)
 		if len(parts) != 2 {
 			continue
 		}
 		if parts[0] == want {
-			return parts[1], nil
+			return strings.TrimSpace(parts[1]), nil
 		}
 	}
 	return "", fmt.Errorf("delivery: pid %d not in any tmux pane", pid)

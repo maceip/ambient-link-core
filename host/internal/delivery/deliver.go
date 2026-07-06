@@ -113,12 +113,14 @@ func TryImmediate(sessionID, text string, reg *Registry) error {
 		logger.Info("delivery: process input", "session", sessionID, "pid", ep.PID)
 		return nil
 	} else {
+		logger.Debug("delivery: process input adapter failed", "session", sessionID, "pid", ep.PID, "err", err)
 		attempts = append(attempts, err.Error())
 	}
 	if err := SendTmuxPID(ep.PID, text, true); err == nil {
 		logger.Info("delivery: tmux", "session", sessionID, "pid", ep.PID)
 		return nil
 	} else {
+		logger.Debug("delivery: tmux adapter failed", "session", sessionID, "pid", ep.PID, "err", err)
 		attempts = append(attempts, err.Error())
 	}
 	if ep.TTY != "" {

@@ -65,6 +65,14 @@ func New(cfg Config) *Bridge {
 	return &Bridge{cfg: cfg, log: cfg.Logger, out: make(chan []byte, 256)}
 }
 
+// Connected reports whether the outbound bridge to the cloud relay is up.
+func (b *Bridge) Connected() bool {
+	b.mu.Lock()
+	ok := b.conn != nil
+	b.mu.Unlock()
+	return ok
+}
+
 // Mirror enqueues a local broadcast payload to send upstream. Non-blocking:
 // if the buffer is full (cloud slow/down) the frame is dropped — the store +
 // subscribe/replay protocol lets the remote catch up on reconnect.

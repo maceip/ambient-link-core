@@ -480,9 +480,24 @@ func (t *JSONLTailer) dispatchClaude(line string) {
 	}
 	_ = t.ing.Ingest(proto.Event{
 		SessionID: rec.SessionID, Agent: t.cfg.Agent, CWD: rec.CWD,
-		Type: eventType, Payload: rec.Message,
+		Type: eventType, Payload: decodeRawPayload(rec.Message),
 		Source: proto.ProducerJSONL, ObservedAt: at,
 	})
+}
+
+// decodeRawPayload turns a raw JSON fragment into the map/string shapes the
+// mux's extractText understands. Passing json.RawMessage through untouched
+// yields a []byte extractText can't read, so snippets (preview, last
+// assistant/user text, landed confirmation) silently come out empty.
+func decodeRawPayload(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	return v
 }
 
 // dispatchCodex parses one line of a Codex rollout-*.jsonl file. Session ID
@@ -507,6 +522,9 @@ func (t *JSONLTailer) dispatchCodex(file, line string) {
 	eventType, eventPayload := classifyCodex(&rec)
 	if eventType == "" {
 		return
+	}
+	if rm, ok := eventPayload.(json.RawMessage); ok {
+		eventPayload = decodeRawPayload(rm)
 	}
 	cwd := t.codexState.getCWD(file)
 	at := time.Now().UnixMilli()
