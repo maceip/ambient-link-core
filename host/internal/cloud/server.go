@@ -27,6 +27,10 @@ type PeerServer struct {
 	log      *slog.Logger
 	upstream Upstream
 
+	// OnDisconnect, when set, runs after a laptop peer connection ends and no
+	// replacement is attached. Proxy role uses it to drop the peer's sessions.
+	OnDisconnect func()
+
 	mu   sync.RWMutex
 	conn *websocket.Conn
 }
@@ -108,12 +112,18 @@ func (p *PeerServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.log.Info("cloud peer: laptop connected", "remote", r.RemoteAddr)
 	defer func() {
 		p.mu.Lock()
-		if p.conn == conn {
+		last := p.conn == conn
+		if last {
 			p.conn = nil
 		}
 		p.mu.Unlock()
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 		p.log.Info("cloud peer: laptop disconnected")
+		// Only fire when this was the active peer (not one replaced by a
+		// newer connection) so a reconnect race doesn't wipe fresh state.
+		if last && p.OnDisconnect != nil {
+			p.OnDisconnect()
+		}
 	}()
 
 	ctx := r.Context()

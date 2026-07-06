@@ -49,10 +49,13 @@ type Hub struct {
 	journal     Journal
 	bearerToken string
 	relayDebug  bool
-	cloud       CloudMirror
-	cloudPeer   CloudPeer
-	dictate     *dictate.Sessions
-	dictHandler dictate.Handler
+	// ephemeralSessions: proxy role — peer-synced sessions are transient,
+	// replaced wholesale on relay_hello and dropped on peer disconnect.
+	ephemeralSessions bool
+	cloud             CloudMirror
+	cloudPeer         CloudPeer
+	dictate           *dictate.Sessions
+	dictHandler       dictate.Handler
 }
 
 // CloudMirror receives every fanned-out broadcast payload so the optional cloud
@@ -168,6 +171,44 @@ func (h *Hub) ApplyUpstreamBroadcast(data []byte) {
 	h.Broadcast(b)
 }
 
+// SetEphemeralSessions makes peer-synced sessions strictly transient (proxy
+// role): each relay_hello replaces the whole set instead of merging, and
+// DropSyncedSessions clears everything when the peer goes away. This is what
+// keeps the cloud from ever accumulating sessions of its own.
+func (h *Hub) SetEphemeralSessions(on bool) {
+	h.mu.Lock()
+	h.ephemeralSessions = on
+	h.mu.Unlock()
+}
+
+// DropSyncedSessions removes every mux session and tells connected web
+// clients each thread ended, so the list empties the moment the laptop peer
+// disconnects (RESTART-DECISION: relay offline → web sees nothing).
+func (h *Hub) DropSyncedSessions() {
+	h.mu.RLock()
+	src := h.mux
+	h.mu.RUnlock()
+	drop, ok := src.(interface{ DropAll() []mux.SessionView })
+	if !ok {
+		return
+	}
+	views := drop.DropAll()
+	now := time.Now().UnixMilli()
+	for _, v := range views {
+		h.Broadcast(proto.Broadcast{
+			Type:      proto.BroadcastThreadEnded,
+			Thread:    v.ThreadID,
+			SessionID: v.SessionID,
+			Agent:     v.Agent,
+			Label:     v.Label,
+			At:        now,
+		})
+	}
+	if len(views) > 0 {
+		h.logger.Info("hub: dropped peer sessions on disconnect", "count", len(views))
+	}
+}
+
 // ApplyRelayHello seeds cloud mux state from the laptop snapshot sent on connect.
 func (h *Hub) ApplyRelayHello(data []byte) {
 	var msg struct {
@@ -179,9 +220,17 @@ func (h *Hub) ApplyRelayHello(data []byte) {
 	}
 	h.mu.RLock()
 	src := h.mux
+	ephemeral := h.ephemeralSessions
 	h.mu.RUnlock()
 	if src == nil {
 		return
+	}
+	if ephemeral {
+		// The hello is the complete truth of the connecting laptop; anything
+		// held over from a previous connection is stale by definition.
+		if drop, ok := src.(interface{ DropAll() []mux.SessionView }); ok {
+			drop.DropAll()
+		}
 	}
 	if sync, ok := src.(interface{ SyncSessions([]mux.SessionView) }); ok {
 		sync.SyncSessions(msg.Sessions)

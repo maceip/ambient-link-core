@@ -4,14 +4,14 @@
 // watcher) observe the same underlying coding-agent activity. They all emit
 // proto.Event values into Mux.Ingest. The mux:
 //
-//   1. Dedupes (SessionID, EventType) pairs that arrive from different
-//      producers within DedupWindow. Producers can fire freely; we collapse.
-//   2. Maintains a per-session aggregate (proto.SessionState + last-snippet
-//      buffers). State changes are pure functions of the deduped event stream.
-//   3. Emits a [proto.Broadcast] envelope to a single Sink whenever the
-//      observable state of a session changes — never on no-op events.
-//   4. Bounds memory: dedup table is time-windowed-GC'd; sessions cap is
-//      enforced by reaping the oldest DEAD session.
+//  1. Dedupes (SessionID, EventType) pairs that arrive from different
+//     producers within DedupWindow. Producers can fire freely; we collapse.
+//  2. Maintains a per-session aggregate (proto.SessionState + last-snippet
+//     buffers). State changes are pure functions of the deduped event stream.
+//  3. Emits a [proto.Broadcast] envelope to a single Sink whenever the
+//     observable state of a session changes — never on no-op events.
+//  4. Bounds memory: dedup table is time-windowed-GC'd; sessions cap is
+//     enforced by reaping the oldest DEAD session.
 //
 // Invariants:
 //   - The mux never trusts any single producer as authoritative.
@@ -192,7 +192,7 @@ func (m *Mux) Ingest(ev proto.Event) error {
 
 	if isNew {
 		m.broadcastLocked(proto.Broadcast{
-			Type: proto.BroadcastThreadStarted,
+			Type:   proto.BroadcastThreadStarted,
 			Thread: s.threadID, Label: s.label, Agent: s.agent, CWD: s.cwd,
 			At: ev.ObservedAt,
 		})
@@ -350,6 +350,18 @@ func (m *Mux) ApplyUpstream(b proto.Broadcast) {
 		s.state = proto.StateDead
 	}
 	s.lastEventAt = at
+}
+
+// DropAll removes every session and returns the views that were dropped.
+// Proxy role uses this so cloud state never outlives the laptop peer that
+// supplied it (RESTART-DECISION: relay offline → web sees nothing).
+func (m *Mux) DropAll() []SessionView {
+	views := m.Snapshot()
+	m.mu.Lock()
+	m.sessions = make(map[string]*session)
+	m.threads = make(map[string]threadSet)
+	m.mu.Unlock()
+	return views
 }
 
 // SyncSessions replaces cloud mux rows from a laptop relay_hello snapshot.
@@ -614,7 +626,7 @@ func (m *Mux) emitTransitionLocked(s *session, state proto.SessionState, at int6
 		// Don't clear idle timer here; the post-transition arm in Ingest will
 		// reset it after broadcasting.
 		m.broadcastLocked(proto.Broadcast{
-			Type: proto.BroadcastThreadBusy,
+			Type:   proto.BroadcastThreadBusy,
 			Thread: s.threadID, SessionID: s.id, Label: s.label, Agent: s.agent, At: at,
 		})
 	case proto.StateAwaitingPermission:
@@ -753,10 +765,10 @@ type session struct {
 	state     proto.SessionState
 	lastEvent int64
 
-	lastEventAt           int64
-	lastSource            proto.ProducerName
-	lastAssistant         string
-	lastUserInput         string
+	lastEventAt          int64
+	lastSource           proto.ProducerName
+	lastAssistant        string
+	lastUserInput        string
 	lastPermissionPrompt string
 
 	idleTimer *time.Timer

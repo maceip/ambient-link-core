@@ -170,6 +170,11 @@ func runServe() error {
 	listen := envOr("AMBIENT_LINK_LISTEN", defaultListen)
 	token := os.Getenv("AMBIENT_LINK_TOKEN")
 	relayDebug := envBool("AMBIENT_LINK_RELAY_DEBUG")
+	// AMBIENT_LINK_ROLE=proxy → Cloud Assist proxy (RESTART-DECISION Option A):
+	// no tailers, no proc watcher, no reaper, no local ingestion, no mDNS.
+	// Sessions exist only while a laptop peer is connected and are dropped the
+	// moment it disconnects. The cloud never invents or retains state.
+	proxyRole := strings.EqualFold(strings.TrimSpace(os.Getenv("AMBIENT_LINK_ROLE")), "proxy")
 	webRoot := defaultWebRoot()
 	jsonlRoot := defaultClaudeJSONLRoot()
 	codexJSONLRoot := defaultCodexJSONLRoot()
@@ -197,6 +202,10 @@ func runServe() error {
 	hub := sink.NewHub(logger)
 	hub.SetBearerToken(token)
 	hub.SetRelayDebug(relayDebug)
+	if proxyRole {
+		hub.SetEphemeralSessions(true)
+		logger.Info("relay: proxy role — sessions live only while a laptop peer is connected")
+	}
 	st, err := store.Open()
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
@@ -239,10 +248,24 @@ func runServe() error {
 	root.Handle("/face-chat/ws", hub)
 	cloudPeer := cloud.NewPeerServer(hub, logger)
 	hub.SetCloudPeer(cloudPeer)
+	if proxyRole {
+		cloudPeer.OnDisconnect = hub.DropSyncedSessions
+	}
 	root.Handle("/ambient-link/relay", cloudPeer)
 	var macCloudBridge *cloud.Bridge
-	root.Handle("/ambient-link/hooks/", hooksHandler)
-	root.Handle("/ambient-link/ingest", ingestHandler)
+	if proxyRole {
+		// The proxy owns no sessions, so nothing may inject state locally —
+		// hooks/ingest posts here would fabricate sessions no laptop can verify.
+		rejectLocal := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "proxy role: local ingestion disabled; connect a laptop relay", http.StatusForbidden)
+		})
+		root.Handle("/ambient-link/hooks/", rejectLocal)
+		root.Handle("/ambient-link/ingest", rejectLocal)
+		root.Handle("/ambient-link/debug/", rejectLocal)
+	} else {
+		root.Handle("/ambient-link/hooks/", hooksHandler)
+		root.Handle("/ambient-link/ingest", ingestHandler)
+	}
 	// Control channel for `host run <agent>` (relay-owned PTY mode).
 	root.Handle("/ambient-link/pty", &pty.ControlHandler{Logger: logger, Token: token})
 	root.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -263,7 +286,7 @@ func runServe() error {
 			// Laptop → this server (true on public.computer when your Mac is linked).
 			"laptop_peer_connected": laptopPeer,
 			// Deprecated: same as laptop_peer_connected. Misleading on Mac localhost.
-			"cloud_peer": laptopPeer,
+			"cloud_peer":  laptopPeer,
 			"journal":     st.Head(),
 			"db":          st.Path(),
 			"default_cwd": cfg.defaultCwd(),
@@ -272,6 +295,7 @@ func runServe() error {
 			// "is the running relay current?".
 			"pid":     os.Getpid(),
 			"version": buildRev(),
+			"role":    map[bool]string{true: "proxy", false: "local"}[proxyRole],
 		})
 	})
 	// Cross-surface config. The Android app POSTs the default working directory
@@ -387,79 +411,84 @@ func runServe() error {
 		writeJSON(w, p)
 	})
 	// Debug: pop glasses HUD from curl (keyboard / automation, no phone UI).
-	root.HandleFunc("/ambient-link/debug/yank", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Thread        string `json:"thread"`
-			Label         string `json:"label"`
-			Agent         string `json:"agent"`
-			LastAssistant string `json:"lastAssistant"`
-			Awaiting      string `json:"awaiting"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if req.Thread == "" {
-			req.Thread = "cursor"
-		}
-		if req.Label == "" {
-			req.Label = req.Thread
-		}
-		if req.Agent == "" {
-			req.Agent = "cursor"
-		}
-		if req.Awaiting == "" {
-			req.Awaiting = "done"
-		}
-		if req.LastAssistant == "" {
-			http.Error(w, "lastAssistant required", http.StatusBadRequest)
-			return
-		}
-		hub.Broadcast(proto.Broadcast{
-			Type:          proto.BroadcastHudYank,
-			Thread:        req.Thread,
-			Label:         req.Label,
-			Agent:         req.Agent,
-			LastAssistant: req.LastAssistant,
-			Awaiting:      req.Awaiting,
-			At:            time.Now().UnixMilli(),
+	// Registered only on a local relay: ServeMux prefers the most specific
+	// pattern, so registering these in proxy role would bypass the
+	// /ambient-link/debug/ reject handler above and let curl fabricate state.
+	if !proxyRole {
+		root.HandleFunc("/ambient-link/debug/yank", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST only", http.StatusMethodNotAllowed)
+				return
+			}
+			var req struct {
+				Thread        string `json:"thread"`
+				Label         string `json:"label"`
+				Agent         string `json:"agent"`
+				LastAssistant string `json:"lastAssistant"`
+				Awaiting      string `json:"awaiting"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Thread == "" {
+				req.Thread = "cursor"
+			}
+			if req.Label == "" {
+				req.Label = req.Thread
+			}
+			if req.Agent == "" {
+				req.Agent = "cursor"
+			}
+			if req.Awaiting == "" {
+				req.Awaiting = "done"
+			}
+			if req.LastAssistant == "" {
+				http.Error(w, "lastAssistant required", http.StatusBadRequest)
+				return
+			}
+			hub.Broadcast(proto.Broadcast{
+				Type:          proto.BroadcastHudYank,
+				Thread:        req.Thread,
+				Label:         req.Label,
+				Agent:         req.Agent,
+				LastAssistant: req.LastAssistant,
+				Awaiting:      req.Awaiting,
+				At:            time.Now().UnixMilli(),
+			})
+			writeJSON(w, map[string]string{"ok": "yank"})
 		})
-		writeJSON(w, map[string]string{"ok": "yank"})
-	})
-	root.HandleFunc("/ambient-link/debug/input", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Thread string `json:"thread"`
-			Text   string `json:"text"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if req.Thread == "" || req.Text == "" {
-			http.Error(w, "thread and text required", http.StatusBadRequest)
-			return
-		}
-		// Delivery ALWAYS submits. The human turn is recorded by inject in the
-		// store with its honest status; we only echo it onto the live HUD when
-		// it was actually written to the agent — no false "sent" (DECISIONS §4).
-		result, err := inject.SendInputResult(req.Thread, req.Text, "")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		if inject.Delivered(result) {
-			_ = m.IngestUserInput(req.Thread, req.Text)
-		}
-		writeJSON(w, map[string]any{"ok": "input", "delivery": result})
-	})
+		root.HandleFunc("/ambient-link/debug/input", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST only", http.StatusMethodNotAllowed)
+				return
+			}
+			var req struct {
+				Thread string `json:"thread"`
+				Text   string `json:"text"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Thread == "" || req.Text == "" {
+				http.Error(w, "thread and text required", http.StatusBadRequest)
+				return
+			}
+			// Delivery ALWAYS submits. The human turn is recorded by inject in the
+			// store with its honest status; we only echo it onto the live HUD when
+			// it was actually written to the agent — no false "sent" (DECISIONS §4).
+			result, err := inject.SendInputResult(req.Thread, req.Text, "")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			if inject.Delivered(result) {
+				_ = m.IngestUserInput(req.Thread, req.Text)
+			}
+			writeJSON(w, map[string]any{"ok": "input", "delivery": result})
+		})
+	}
 	if webRoot != "" {
 		if st, err := os.Stat(webRoot); err != nil || !st.IsDir() {
 			return fmt.Errorf("web-root %q: %w", webRoot, err)
@@ -485,87 +514,93 @@ func runServe() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := discovery.Advertise(ctx, listen, token, logger); err != nil {
-		logger.Warn("host: mdns advertise failed", "err", err)
-	} else {
-		logger.Info("host: mdns advertising", "type", discovery.ServiceType)
-	}
+	// Everything below observes THIS machine (mDNS, transcript tailers, proc
+	// watcher, delivery retry, stale reaper). A Cloud Assist proxy owns no
+	// sessions and observes nothing locally — its only inputs are the laptop
+	// peer socket and web clients — so none of it is even constructed there.
+	if !proxyRole {
+		if err := discovery.Advertise(ctx, listen, token, logger); err != nil {
+			logger.Warn("host: mdns advertise failed", "err", err)
+		} else {
+			logger.Info("host: mdns advertising", "type", discovery.ServiceType)
+		}
 
-	// JSONL tailers — one per agent, both always-on. They share the mux,
-	// so a session that fires both hook events and JSONL writes gets deduped
-	// by the mux on (session_id, event_type) within DedupWindow.
-	if jsonlRoot != "" {
-		if err := startJSONLTailer(ctx, m, jsonlRoot, producers.FormatClaude, "claude", logger); err != nil {
-			return err
-		}
-	}
-	if codexJSONLRoot != "" {
-		if err := startJSONLTailer(ctx, m, codexJSONLRoot, producers.FormatCodex, "codex", logger); err != nil {
-			return err
-		}
-	}
-	if cursorJSONLRoot != "" {
-		if err := startJSONLTailer(ctx, m, cursorJSONLRoot, producers.FormatCursor, "cursor", logger); err != nil {
-			return err
-		}
-	}
-
-	// Process watcher
-	procW, err := producers.NewProcWatcher(m, producers.ProcConfig{
-		Logger:   logger,
-		Registry: reg,
-		LiveSessions: func() []producers.LiveSession {
-			views := m.Snapshot()
-			out := make([]producers.LiveSession, 0, len(views))
-			for _, v := range views {
-				out = append(out, producers.LiveSession{
-					SessionID: v.SessionID,
-					Agent:     v.Agent,
-					CWD:       v.CWD,
-					State:     v.State,
-				})
+		// JSONL tailers — one per agent, both always-on. They share the mux,
+		// so a session that fires both hook events and JSONL writes gets deduped
+		// by the mux on (session_id, event_type) within DedupWindow.
+		if jsonlRoot != "" {
+			if err := startJSONLTailer(ctx, m, jsonlRoot, producers.FormatClaude, "claude", logger); err != nil {
+				return err
 			}
-			return out
-		},
-		OnSessionLive: func(sessionID string) {
-			if delivery.RetryPending(sessionID, reg, box) {
-				logger.Info("delivery: retry on live session", "session", sessionID)
-			}
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("proc watcher: %w", err)
-	}
-	go func() {
-		if err := procW.Run(ctx); err != nil {
-			logger.Error("proc: watcher exited", "err", err)
 		}
-	}()
-	logger.Info("proc: watcher started")
+		if codexJSONLRoot != "" {
+			if err := startJSONLTailer(ctx, m, codexJSONLRoot, producers.FormatCodex, "codex", logger); err != nil {
+				return err
+			}
+		}
+		if cursorJSONLRoot != "" {
+			if err := startJSONLTailer(ctx, m, cursorJSONLRoot, producers.FormatCursor, "cursor", logger); err != nil {
+				return err
+			}
+		}
 
-	go func() {
-		t := time.NewTicker(3 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if n := delivery.FlushPending(reg, box); n > 0 {
-					logger.Info("delivery: retry flush", "count", n)
+		// Process watcher
+		procW, err := producers.NewProcWatcher(m, producers.ProcConfig{
+			Logger:   logger,
+			Registry: reg,
+			LiveSessions: func() []producers.LiveSession {
+				views := m.Snapshot()
+				out := make([]producers.LiveSession, 0, len(views))
+				for _, v := range views {
+					out = append(out, producers.LiveSession{
+						SessionID: v.SessionID,
+						Agent:     v.Agent,
+						CWD:       v.CWD,
+						State:     v.State,
+					})
+				}
+				return out
+			},
+			OnSessionLive: func(sessionID string) {
+				if delivery.RetryPending(sessionID, reg, box) {
+					logger.Info("delivery: retry on live session", "session", sessionID)
+				}
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("proc watcher: %w", err)
+		}
+		go func() {
+			if err := procW.Run(ctx); err != nil {
+				logger.Error("proc: watcher exited", "err", err)
+			}
+		}()
+		logger.Info("proc: watcher started")
+
+		go func() {
+			t := time.NewTicker(3 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if n := delivery.FlushPending(reg, box); n > 0 {
+						logger.Info("delivery: retry flush", "count", n)
+					}
 				}
 			}
-		}
-	}()
+		}()
 
-	// Stale-session reaper — catch-all only. A session is reaped solely when
-	// its process is NOT alive (registry has no live endpoint). A living agent,
-	// idle or waiting for hours, is never killed on a timer (DECISIONS.md §5).
-	isLive := func(sessionID string) bool {
-		_, ok := reg.Get(sessionID)
-		return ok
+		// Stale-session reaper — catch-all only. A session is reaped solely when
+		// its process is NOT alive (registry has no live endpoint). A living agent,
+		// idle or waiting for hours, is never killed on a timer (DECISIONS.md §5).
+		isLive := func(sessionID string) bool {
+			_, ok := reg.Get(sessionID)
+			return ok
+		}
+		go runStaleReaper(ctx, m, 30*time.Minute, 5*time.Minute, isLive, logger)
 	}
-	go runStaleReaper(ctx, m, 30*time.Minute, 5*time.Minute, isLive, logger)
 
 	// Cloud reverse channel (G5). Optional: only when AMBIENT_LINK_CLOUD is set.
 	// Dials out to the cloud relay, mirrors broadcasts up, and accepts
