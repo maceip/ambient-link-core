@@ -181,14 +181,35 @@ func Uninstall(opts Options) error {
 // "matcher" (optional) and "handler" (type + url/command). We install entries
 // for the events that matter for session lifecycle.
 type claudeSettings = map[string]any
+
+// Claude Code's real hooks schema (code.claude.com/docs/en/hooks): each event
+// maps to matcher entries whose nested "hooks" array holds COMMAND hooks. The
+// command receives the event JSON on stdin and its stdout (exit 0) is parsed
+// as the hook response — which is exactly the JSON delivery/hooks.go returns
+// (Stop → {"decision":"block","reason":<queued text>} etc.). There is no
+// "http" handler type; the previous installer wrote one and Claude Code
+// silently ignored every entry, so the hooks delivery path never fired.
 type claudeHookEntry struct {
-	Matcher string        `json:"matcher,omitempty"`
-	Handler claudeHandler `json:"handler"`
+	Matcher string          `json:"matcher,omitempty"`
+	Hooks   []claudeHookCmd `json:"hooks"`
 }
-type claudeHandler struct {
-	Type   string            `json:"type"` // "http"
-	URL    string            `json:"url,omitempty"`
-	Header map[string]string `json:"header,omitempty"`
+type claudeHookCmd struct {
+	Type    string `json:"type"` // "command"
+	Command string `json:"command"`
+	Timeout int    `json:"timeout,omitempty"` // seconds
+}
+
+// claudeHookCommand builds the curl bridge: stdin (event JSON) → relay hooks
+// endpoint → response JSON on stdout for Claude Code to act on. -f maps relay
+// errors to a non-zero exit (non-blocking for the agent); -m keeps a dead
+// relay from stalling the session.
+func claudeHookCommand(hostURL, token string) string {
+	url := strings.TrimRight(hostURL, "/") + "/ambient-link/hooks/claude?marker=" + HookEntryMarker
+	cmd := "curl -fsS -m 5 -X POST -H 'Content-Type: application/json'"
+	if token != "" {
+		cmd += " -H 'Authorization: Bearer " + token + "'"
+	}
+	return cmd + " --data-binary @- '" + url + "'"
 }
 
 func installClaudeHooks(path, hostURL, token string) (bool, error) {
@@ -223,22 +244,22 @@ func installClaudeHooks(path, hostURL, token string) (bool, error) {
 	changed := false
 	for _, w := range want {
 		existing := entriesFor(w.event)
-		if hasAmbientLinkHookEntry(existing) {
-			continue
-		}
 		entry := claudeHookEntry{
 			Matcher: w.matcher,
-			Handler: claudeHandler{
-				Type: "http",
-				URL:  strings.TrimRight(hostURL, "/") + "/ambient-link/hooks/claude?marker=" + HookEntryMarker,
-				Header: map[string]string{
-					"Authorization": "Bearer " + token,
-				},
-			},
+			Hooks: []claudeHookCmd{{
+				Type:    "command",
+				Command: claudeHookCommand(hostURL, token),
+				Timeout: 10,
+			}},
 		}
 		var asMap map[string]any
 		mustRoundTrip(entry, &asMap)
-		hooks[w.event] = append(existing, asMap)
+		if containsEntry(existing, asMap) {
+			continue
+		}
+		// Replace any stale marker entry (e.g. the legacy "http" handler shape
+		// Claude Code ignored) instead of stacking a second one beside it.
+		hooks[w.event] = append(filterOutMarker(existing), asMap)
 		changed = true
 	}
 	if !changed {
@@ -285,17 +306,51 @@ func uninstallClaudeHooks(path string) error {
 	return writeJSON(path, settings, 0o644)
 }
 
-// hasAmbientLinkHookEntry checks whether any entry in arr carries our marker
-// in its handler URL.
-func hasAmbientLinkHookEntry(arr []any) bool {
+// containsEntry reports whether arr already holds an entry deep-equal to
+// want — the idempotency check for re-running install with the same options.
+func containsEntry(arr []any, want map[string]any) bool {
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		return false
+	}
 	for _, x := range arr {
-		m, _ := x.(map[string]any)
-		h, _ := m["handler"].(map[string]any)
-		if u, _ := h["url"].(string); strings.Contains(u, HookEntryMarker) {
+		m, ok := x.(map[string]any)
+		if !ok || !entryCarriesMarker(m) {
+			continue
+		}
+		got, err := json.Marshal(m)
+		if err == nil && string(got) == string(wantJSON) {
 			return true
 		}
-		// Codex command-style handler
-		if cmd, _ := h["command"].(string); strings.Contains(cmd, HookEntryMarker) {
+	}
+	return false
+}
+
+// entryCarriesMarker reports whether one settings entry references our
+// endpoint — in a legacy handler {url|command} (both agents' old shapes) or
+// in Claude Code's nested hooks[].command array.
+func entryCarriesMarker(m map[string]any) bool {
+	h, _ := m["handler"].(map[string]any)
+	if u, _ := h["url"].(string); strings.Contains(u, HookEntryMarker) {
+		return true
+	}
+	if cmd, _ := h["command"].(string); strings.Contains(cmd, HookEntryMarker) {
+		return true
+	}
+	nested, _ := m["hooks"].([]any)
+	for _, n := range nested {
+		nm, _ := n.(map[string]any)
+		if cmd, _ := nm["command"].(string); strings.Contains(cmd, HookEntryMarker) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAmbientLinkHookEntry checks whether any entry in arr carries our marker.
+func hasAmbientLinkHookEntry(arr []any) bool {
+	for _, x := range arr {
+		if m, _ := x.(map[string]any); entryCarriesMarker(m) {
 			return true
 		}
 	}
@@ -305,11 +360,7 @@ func hasAmbientLinkHookEntry(arr []any) bool {
 func filterOutMarker(arr []any) []any {
 	out := make([]any, 0, len(arr))
 	for _, x := range arr {
-		m, _ := x.(map[string]any)
-		h, _ := m["handler"].(map[string]any)
-		u, _ := h["url"].(string)
-		c, _ := h["command"].(string)
-		if strings.Contains(u, HookEntryMarker) || strings.Contains(c, HookEntryMarker) {
+		if m, _ := x.(map[string]any); entryCarriesMarker(m) {
 			continue
 		}
 		out = append(out, x)
@@ -345,16 +396,18 @@ func installCodexHooks(path, hostURL, token string) (bool, error) {
 	changed := false
 	for _, ev := range wantEvents {
 		existing, _ := hooks[ev].([]any)
-		if hasAmbientLinkHookEntry(existing) {
-			continue
-		}
 		entry := map[string]any{
 			"handler": map[string]any{
 				"type":    "command",
 				"command": curlCmd,
 			},
 		}
-		hooks[ev] = append(existing, entry)
+		if containsEntry(existing, entry) {
+			continue
+		}
+		// Replace stale marker entries (old URL/token) rather than skipping,
+		// so a re-run with new options actually takes effect.
+		hooks[ev] = append(filterOutMarker(existing), entry)
 		changed = true
 	}
 	if !changed {

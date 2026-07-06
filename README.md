@@ -39,6 +39,28 @@ curl localhost:5181/ambient-link/status
 Then point your relay app (e.g. ambient-link-meta) at
 `ws://<host-ip>:5181/ambient-link/ws`.
 
+## Launching agents (the blessed path)
+
+Replies from the glasses/web can only land in an agent the relay can write
+to. Reliability depends on HOW the agent was started — use these, in order:
+
+1. **`ambient-link-host run claude`** (or `codex`, …) — the relay owns the
+   agent's PTY, so delivery is a direct stdin write. Most reliable; use this
+   when you're starting a session you want to drive remotely.
+2. **Inside tmux** (e.g. `agents/start-claude.sh`) — the relay delivers via
+   `tmux send-keys` to the agent's pane. Works for agents you didn't start
+   through the relay, as long as they live in a tmux pane on the default
+   server.
+3. **Bare terminal + hooks** — after `ambient-link-host install --no-service
+   -host-url http://127.0.0.1:5181`, Claude/Codex hooks POST lifecycle events
+   to the relay and queued replies are handed to the agent at its next hook
+   checkpoint (Stop/permission). Highest latency of the three: delivery waits
+   for the agent to reach a checkpoint.
+
+A bare terminal *without* hooks is observe-only on macOS: the relay will see
+the session (transcript tailer) but has no way to type into it — replies
+queue in the outbox and the UI honestly reports them undelivered.
+
 ## Design principles
 
 - **Defense in depth.** No single signal source is authoritative. Hooks +
