@@ -43,6 +43,9 @@ type Config struct {
 	Deliver func(thread, text string) (status string, err error)
 	// Special routes a single raw key (permission answer). Optional.
 	Special func(thread, key string) error
+	// Create spawns a new agent session on this machine (cloud-forwarded
+	// create from the glasses). Optional.
+	Create func(agent, cwd, prompt string) error
 	// Snapshot returns an initial state frame to send on each (re)connect.
 	// Optional.
 	Snapshot func() []byte
@@ -191,6 +194,9 @@ func (b *Bridge) handleDownstream(data []byte) {
 		Thread string `json:"thread"`
 		Text   string `json:"text"`
 		Key    string `json:"key"`
+		Agent  string `json:"agent"`
+		CWD    string `json:"cwd"`
+		Prompt string `json:"prompt"`
 	}
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return
@@ -212,6 +218,15 @@ func (b *Bridge) handleDownstream(data []byte) {
 		}
 		if err := b.cfg.Special(msg.Thread, msg.Key); err != nil {
 			b.log.Warn("cloud: downstream special failed", "thread", msg.Thread, "err", err)
+		}
+	case "create":
+		if msg.Agent == "" || b.cfg.Create == nil {
+			return
+		}
+		if err := b.cfg.Create(msg.Agent, msg.CWD, msg.Prompt); err != nil {
+			b.log.Warn("cloud: downstream create failed", "agent", msg.Agent, "err", err)
+		} else {
+			b.log.Info("cloud: downstream create spawned", "agent", msg.Agent, "cwd", msg.CWD)
 		}
 	}
 }

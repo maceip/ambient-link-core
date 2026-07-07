@@ -60,6 +60,7 @@ import (
 	"github.com/maceip/ambient-link-core/host/internal/proto"
 	"github.com/maceip/ambient-link-core/host/internal/pty"
 	"github.com/maceip/ambient-link-core/host/internal/sink"
+	"github.com/maceip/ambient-link-core/host/internal/spawn"
 	"github.com/maceip/ambient-link-core/host/internal/store"
 	"github.com/maceip/ambient-link-core/host/internal/webapp"
 )
@@ -381,10 +382,41 @@ func runServe() error {
 				"now":      time.Now().UnixMilli(),
 			})
 		case http.MethodPost:
-			w.WriteHeader(http.StatusNotImplemented)
-			writeJSON(w, map[string]any{
-				"error": "session creation is not wired on this host yet; start the agent in a terminal first",
-			})
+			var req struct {
+				Agent  string `json:"agent"`
+				CWD    string `json:"cwd"`
+				Prompt string `json:"prompt"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Agent == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				writeJSON(w, map[string]any{"error": "agent required"})
+				return
+			}
+			if proxyRole {
+				// The proxy owns no machine to spawn on — forward to the
+				// connected laptop; honest 503 when there is none.
+				if !cloudPeer.Connected() {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					writeJSON(w, map[string]any{"error": "no laptop connected — start the relay on your Mac"})
+					return
+				}
+				if err := cloudPeer.SendCreate(req.Agent, req.CWD, req.Prompt); err != nil {
+					w.WriteHeader(http.StatusBadGateway)
+					writeJSON(w, map[string]any{"error": err.Error()})
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				writeJSON(w, map[string]any{"ok": "forwarded", "agent": req.Agent})
+				return
+			}
+			name, err := spawn.Agent(req.Agent, req.CWD, req.Prompt)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				writeJSON(w, map[string]any{"error": err.Error()})
+				return
+			}
+			logger.Info("spawn: agent session started", "agent", req.Agent, "tmux", name, "cwd", req.CWD)
+			writeJSON(w, map[string]any{"ok": "spawned", "agent": req.Agent, "tmux": name})
 		default:
 			w.Header().Set("Allow", "GET, POST")
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -635,6 +667,13 @@ func runServe() error {
 			},
 			Special:  inject.SendSpecial,
 			Snapshot: func() []byte { return cloudSnapshot(m, st) },
+			Create: func(agent, cwd, prompt string) error {
+				name, err := spawn.Agent(agent, cwd, prompt)
+				if err == nil {
+					logger.Info("spawn: agent session started (cloud create)", "agent", agent, "tmux", name, "cwd", cwd)
+				}
+				return err
+			},
 		})
 		hub.SetCloud(macCloudBridge)
 		go macCloudBridge.Run(ctx)

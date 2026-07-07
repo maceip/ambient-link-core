@@ -65,6 +65,22 @@ func (p *PeerServer) SendInput(thread, text, clientID string) error {
 	return p.write(payload)
 }
 
+// SendCreate forwards a create-session request to the laptop peer, which
+// spawns the agent in a detached tmux session (simplest create that the
+// delivery adapters can immediately reach).
+func (p *PeerServer) SendCreate(agent, cwd, prompt string) error {
+	payload, err := json.Marshal(map[string]any{
+		"type":   "create",
+		"agent":  agent,
+		"cwd":    cwd,
+		"prompt": prompt,
+	})
+	if err != nil {
+		return err
+	}
+	return p.write(payload)
+}
+
 // SendSpecial forwards a permission/special key to the laptop peer.
 func (p *PeerServer) SendSpecial(thread, key string) error {
 	payload, err := json.Marshal(map[string]any{
