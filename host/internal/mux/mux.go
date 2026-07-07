@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -437,6 +438,26 @@ func (m *Mux) sessionForUpstreamLocked(b proto.Broadcast) *session {
 		ObservedAt: b.At,
 	}
 	s, _ := m.getOrCreateLocked(ev)
+	// The laptop already computed the thread id; state broadcasts carry
+	// Thread but not CWD, so re-deriving here minted a different id (hash of
+	// an empty cwd). The web app then showed a thread the laptop's delivery
+	// registry had never heard of and every reply died with "inject: unknown
+	// thread". Trust the upstream id.
+	if b.Thread != "" && s.threadID != b.Thread {
+		if tset, ok := m.threads[s.threadID]; ok {
+			delete(tset, s.id)
+			if len(tset) == 0 {
+				delete(m.threads, s.threadID)
+			}
+		}
+		s.threadID = b.Thread
+		tset, ok := m.threads[b.Thread]
+		if !ok {
+			tset = make(threadSet)
+			m.threads[b.Thread] = tset
+		}
+		tset[s.id] = struct{}{}
+	}
 	if b.Label != "" {
 		s.label = b.Label
 	}
@@ -577,12 +598,19 @@ type SessionView struct {
 	PermissionPrompt string `json:"permission_prompt,omitempty"`
 }
 
-// ThreadIDFor is the pure function that maps (agent, cwd) → thread id.
-// Same input always yields the same id; exposed so producers and tests can
-// agree on identity without going through Ingest.
+// ThreadIDFor is the function that maps (agent, cwd) → thread id.
+// Same directory always yields the same id no matter how a producer spells
+// the path: the PTY wrapper sees the shell's logical cwd (/tmp/x) while the
+// transcript tailer sees the physical one (/private/tmp/x on macOS), and
+// hashing the raw strings split one session into two threads — the visible
+// thread had no delivery route ("inject: unknown thread"). Exposed so
+// producers and tests can agree on identity without going through Ingest.
 func ThreadIDFor(agent, cwd string) string {
 	if agent == "" {
 		agent = "unknown"
+	}
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil && resolved != "" {
+		cwd = resolved
 	}
 	h := sha256.Sum256([]byte(agent + "::" + cwd))
 	return agent + "-" + hex.EncodeToString(h[:])[:10]

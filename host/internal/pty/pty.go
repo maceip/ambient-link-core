@@ -197,6 +197,14 @@ func controlLoop(ctx context.Context, base, token, thread string, ptmx xpty.Pty,
 				_, _ = ptmx.Write([]byte(m.Text))
 			}
 			if m.Submit {
+				// A CR that lands in the same read burst as the text is
+				// treated by TUI composers (codex) as a pasted newline, not a
+				// submit — the message sits in the composer forever. Let the
+				// TUI consume the text as input first, then send Enter as a
+				// distinct keypress.
+				if m.Text != "" {
+					time.Sleep(150 * time.Millisecond)
+				}
 				_, _ = ptmx.Write([]byte("\r"))
 			}
 		}
