@@ -303,6 +303,21 @@ func (t *JSONLTailer) scanAndOpen(root string) {
 	})
 }
 
+// Attach force-opens one transcript regardless of the initial-scan StaleAge
+// window, replaying a bounded tail so the session's cwd/label/preview come
+// back. Used when the proc watcher sees a live process for a session the mux
+// doesn't know — e.g. a quiet-but-alive agent after a relay restart, which
+// otherwise stays invisible even though its delivery endpoint is registered.
+func (t *JSONLTailer) Attach(path string) {
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	t.openFile(context.Background(), path, false, t.cfg.StartupReplayBytes)
+}
+
 func (t *JSONLTailer) openFile(ctx context.Context, path string, fromStart bool, replayBytes int64) {
 	t.mu.Lock()
 	if t.stopped {

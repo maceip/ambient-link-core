@@ -352,6 +352,14 @@ func (m *Mux) ApplyUpstream(b proto.Broadcast) {
 	s.lastEventAt = at
 }
 
+// HasSession reports whether the mux currently tracks sessionID.
+func (m *Mux) HasSession(sessionID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.sessions[sessionID]
+	return ok
+}
+
 // DropAll removes every session and returns the views that were dropped.
 // Proxy role uses this so cloud state never outlives the laptop peer that
 // supplied it (RESTART-DECISION: relay offline → web sees nothing).

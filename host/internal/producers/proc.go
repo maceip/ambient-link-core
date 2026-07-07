@@ -162,6 +162,17 @@ func (w *ProcWatcher) sweep(ctx context.Context) {
 	for pid, comm := range pids {
 		agent := agentFromCommand(comm)
 		sessions := w.sessionsFor(ctx, pid)
+		// Claude's daemon-era processes don't hold the transcript .jsonl open
+		// (only a /tmp/cc-daemon-*/rv/<uuid>.sock), so lsof-on-files misses
+		// them — but the session UUID rides in argv. Without this, a living
+		// daemon session has no endpoint and the reaper marks it DEAD after
+		// 30 quiet minutes.
+		if sid := sessionIDFromArgv(comm); sid != "" {
+			if sessions == nil {
+				sessions = map[string]struct{}{}
+			}
+			sessions[sid] = struct{}{}
+		}
 		if len(sessions) == 0 && useWindowsProcSupport {
 			// Background helpers (codex app-server / sandbox-setup / node_repl)
 			// are not the interactive TUI we inject into — never register them.
@@ -264,6 +275,21 @@ var codexSessionUUID = regexp.MustCompile(`([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-
 // Cursor Agent CLI keeps session state under ~/.cursor/chats/<hash>/<uuid>/store.db
 var cursorChatsSessionUUID = regexp.MustCompile(`/\.cursor/chats/[^/]+/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/store\.db`)
 
+// argvSessionID matches `--session-id <uuid>` / `--session-id=<uuid>` in an
+// agent command line (claude daemon-hosted sessions carry it).
+var argvSessionID = regexp.MustCompile(`--session-id[= ]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})`)
+
+// ccDaemonSock matches claude's daemon session socket, whose filename is the
+// session UUID: /tmp/cc-daemon-<uid>/<hash>/rv/<uuid>.sock
+var ccDaemonSock = regexp.MustCompile(`/cc-daemon-[^/]+/.*/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.sock$`)
+
+func sessionIDFromArgv(cmd string) string {
+	if m := argvSessionID.FindStringSubmatch(cmd); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
 func (w *ProcWatcher) sessionsFor(ctx context.Context, pid int) map[string]struct{} {
 	out, err := exec.CommandContext(ctx, w.cfg.LsofPath, "-nP", "-p", strconv.Itoa(pid), "-Fn").Output()
 	if err != nil {
@@ -296,6 +322,10 @@ func (w *ProcWatcher) sessionsFor(ctx context.Context, pid int) map[string]struc
 			continue
 		}
 		if m := cursorChatsSessionUUID.FindStringSubmatch(path); m != nil {
+			sessions[m[1]] = struct{}{}
+			continue
+		}
+		if m := ccDaemonSock.FindStringSubmatch(path); m != nil {
 			sessions[m[1]] = struct{}{}
 		}
 	}

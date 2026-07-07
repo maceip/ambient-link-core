@@ -528,18 +528,19 @@ func runServe() error {
 		// JSONL tailers — one per agent, both always-on. They share the mux,
 		// so a session that fires both hook events and JSONL writes gets deduped
 		// by the mux on (session_id, event_type) within DedupWindow.
+		var claudeTailer, codexTailer, cursorTailer *producers.JSONLTailer
 		if jsonlRoot != "" {
-			if err := startJSONLTailer(ctx, m, jsonlRoot, producers.FormatClaude, "claude", logger); err != nil {
+			if claudeTailer, err = startJSONLTailer(ctx, m, jsonlRoot, producers.FormatClaude, "claude", logger); err != nil {
 				return err
 			}
 		}
 		if codexJSONLRoot != "" {
-			if err := startJSONLTailer(ctx, m, codexJSONLRoot, producers.FormatCodex, "codex", logger); err != nil {
+			if codexTailer, err = startJSONLTailer(ctx, m, codexJSONLRoot, producers.FormatCodex, "codex", logger); err != nil {
 				return err
 			}
 		}
 		if cursorJSONLRoot != "" {
-			if err := startJSONLTailer(ctx, m, cursorJSONLRoot, producers.FormatCursor, "cursor", logger); err != nil {
+			if cursorTailer, err = startJSONLTailer(ctx, m, cursorJSONLRoot, producers.FormatCursor, "cursor", logger); err != nil {
 				return err
 			}
 		}
@@ -564,6 +565,16 @@ func runServe() error {
 			OnSessionLive: func(sessionID string) {
 				if delivery.RetryPending(sessionID, reg, box) {
 					logger.Info("delivery: retry on live session", "session", sessionID)
+				}
+				// The process is alive but the mux doesn't know the session —
+				// e.g. a quiet-but-alive agent after a relay restart (initial
+				// scan skips transcripts older than StaleAge). Resurrect it
+				// from its transcript so the list matches reality.
+				if !m.HasSession(sessionID) {
+					if path, tailer := findSessionTranscript(sessionID, jsonlRoot, codexJSONLRoot, cursorJSONLRoot, claudeTailer, codexTailer, cursorTailer); tailer != nil {
+						logger.Info("proc: resurrecting live session from transcript", "session", sessionID, "path", path)
+						tailer.Attach(path)
+					}
 				}
 			},
 		})
@@ -830,7 +841,7 @@ func runPair() error {
 }
 
 // startJSONLTailer constructs and launches a tailer goroutine for one agent.
-func startJSONLTailer(ctx context.Context, m *mux.Mux, root string, format producers.JSONLFormat, agent string, log *slog.Logger) error {
+func startJSONLTailer(ctx context.Context, m *mux.Mux, root string, format producers.JSONLFormat, agent string, log *slog.Logger) (*producers.JSONLTailer, error) {
 	tailer, err := producers.NewJSONLTailer(m, producers.JSONLConfig{
 		Root:   root,
 		Format: format,
@@ -838,7 +849,7 @@ func startJSONLTailer(ctx context.Context, m *mux.Mux, root string, format produ
 		Logger: log,
 	})
 	if err != nil {
-		return fmt.Errorf("jsonl tailer (%s): %w", agent, err)
+		return nil, fmt.Errorf("jsonl tailer (%s): %w", agent, err)
 	}
 	go func() {
 		if err := tailer.Run(ctx); err != nil {
@@ -846,7 +857,34 @@ func startJSONLTailer(ctx context.Context, m *mux.Mux, root string, format produ
 		}
 	}()
 	log.Info("jsonl: tailer started", "agent", agent, "root", root)
-	return nil
+	return tailer, nil
+}
+
+// findSessionTranscript locates a session's transcript by uuid across the
+// agents' on-disk layouts. Returns the path and the tailer that owns it.
+func findSessionTranscript(sessionID string, claudeRoot, codexRoot, cursorRoot string, claudeT, codexT, cursorT *producers.JSONLTailer) (string, *producers.JSONLTailer) {
+	if claudeT != nil && claudeRoot != "" {
+		if hits, _ := filepath.Glob(filepath.Join(claudeRoot, "*", sessionID+".jsonl")); len(hits) > 0 {
+			return hits[0], claudeT
+		}
+	}
+	if codexT != nil && codexRoot != "" {
+		// rollout files nest by date: <root>/YYYY/MM/DD/rollout-...-<uuid>.jsonl
+		for _, pat := range []string{
+			filepath.Join(codexRoot, "*", "*", "*", "rollout-*"+sessionID+".jsonl"),
+			filepath.Join(codexRoot, "rollout-*"+sessionID+".jsonl"),
+		} {
+			if hits, _ := filepath.Glob(pat); len(hits) > 0 {
+				return hits[0], codexT
+			}
+		}
+	}
+	if cursorT != nil && cursorRoot != "" {
+		if hits, _ := filepath.Glob(filepath.Join(cursorRoot, "*", "agent-transcripts", sessionID, sessionID+".jsonl")); len(hits) > 0 {
+			return hits[0], cursorT
+		}
+	}
+	return "", nil
 }
 
 func newLogger(level string) *slog.Logger {
