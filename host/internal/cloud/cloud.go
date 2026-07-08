@@ -96,7 +96,18 @@ func (b *Bridge) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := b.session(ctx); err != nil && ctx.Err() == nil {
+		started := time.Now()
+		err := b.session(ctx)
+		// A session that lived a while was healthy — its death (laptop sleep,
+		// network blip) says nothing about the next dial, so retry fast. The
+		// old code reset backoff only on a clean return, which never happens
+		// for network death, so after a few early flaps every reconnect for
+		// the life of the process waited the full 30s — the glasses showed
+		// "not connected" for up to 30s every time the Mac woke.
+		if time.Since(started) > 45*time.Second {
+			backoff = time.Second
+		}
+		if err != nil && ctx.Err() == nil {
 			b.log.Warn("cloud: session ended", "err", err, "retry_in", backoff.String())
 			select {
 			case <-ctx.Done():
